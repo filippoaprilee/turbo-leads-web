@@ -1,0 +1,10 @@
+.streamlit/secrets.toml
+secrets.toml
+stato/
+risultati/
+.motore/
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
