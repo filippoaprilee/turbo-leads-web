@@ -11,7 +11,7 @@ import time
 
 import streamlit as st
 
-from turbo_scraper import FITNESS, get_dataset
+from turbo_scraper import FITNESS, get_dataset, search_variants
 from web_backend import (JobManager, MAX_PAGES, MAX_SEARCHES, MAX_WORKERS,
                          build_categories, parse_geography, safe_csv_bytes,
                          select_geography, tail_log)
@@ -98,7 +98,7 @@ with st.sidebar:
     st.divider()
     st.caption('Limiti cautelativi del piano gratuito: una ricerca alla volta, massimo 200 query per lotto, massimo 4 lavoratori. I dati non sono archivio permanente.')
 
-st.title('Ricerca attività in Italia')
+st.title('Trova attività indipendenti')
 st.write('Seleziona categorie e aree geografiche. Il programma esclude per impostazione predefinita le categorie non pertinenti e crea un CSV scaricabile.')
 
 try:
@@ -167,24 +167,45 @@ try:
 except ValueError as ex:
     categories, category_error = [], str(ex)
 
-st.subheader('3. Precisione e velocità')
-c1, c2, c3, c4 = st.columns(4)
-with c1:
+st.subheader('3. Profondità e filtri')
+st.caption('Lascia i valori consigliati se non conosci le impostazioni tecniche.')
+depth = st.radio('Quanto a fondo vuoi cercare?',
+    ['Veloce', 'Equilibrata', 'Approfondita'], index=1, horizontal=True)
+st.caption({
+    'Veloce': 'Una ricerca per categoria e comune. Rapida, ma può perdere attività.',
+    'Equilibrata': 'Due varianti di ricerca, 5 pagine predefinite e dettagli aggiuntivi. Consigliata.',
+    'Approfondita': 'Fino a 4 varianti per categoria, 10 pagine e recupero dettagli. Richiede più tempo.',
+}[depth])
+with st.expander('Filtra catene e franchising', expanded=True):
+    exclude_chains = st.checkbox('Escludi marchi e grandi catene conosciute', value=True)
+    st.caption('Esempi: McFIT, FitActive, Basic-Fit, Virgin Active, Decathlon, Terranova. Il filtro riconosce soltanto marchi noti nell’elenco: non identifica con certezza tutti i franchising.')
+    custom_brands = st.text_area('Altri marchi da escludere (facoltativo)',
+        placeholder='Un nome per riga, oppure separati da virgole',
+        help='Inserisci nomi di catene specifici, non parole come palestra o fitness.')
+    extra_brands = [x.strip() for x in custom_brands.replace('\n', ',').split(',') if x.strip()]
+    filter_label = st.selectbox('Qualità dei risultati',
+        ['Solo categorie pertinenti (consigliato)', 'Includi anche attività dubbie'])
+    mode = 'rigoroso' if filter_label.startswith('Solo') else 'ampio'
+with st.expander('Impostazioni tecniche (facoltative)'):
+    st.caption('Un lotto indica quante ricerche eseguire, NON quante aziende trovare.')
     batch = st.number_input('Ricerche per lotto', min_value=1, max_value=MAX_SEARCHES,
-                            value=60, step=10)
-with c2:
-    workers = st.slider('Ricerche parallele', 1, MAX_WORKERS, 2)
-with c3:
-    pages = st.slider('Pagine per ricerca', 1, MAX_PAGES, 2)
-with c4:
-    mode = st.selectbox('Filtro categoria', ['rigoroso', 'ampio'],
-                        help='Rigoroso: scarta le schede senza categoria verificabile.')
+                            value={'Veloce': 100, 'Equilibrata': 60, 'Approfondita': 25}[depth],
+                            step=5, help='Ripeti la stessa ricerca per proseguire finché i dati temporanei restano sul server.')
+    workers = st.slider('Ricerche contemporanee', 1, MAX_WORKERS, 2,
+        help='Aumentare questo valore può causare limiti temporanei sulla rete.')
+    pages = st.slider('Pagine da consultare per ricerca', 1, MAX_PAGES,
+        {'Veloce': 2, 'Equilibrata': 5, 'Approfondita': 10}[depth],
+        help='Più pagine possono aumentare i risultati, ma non garantiscono copertura completa.')
+variants = search_variants(categories, depth) if categories else []
+m1, m2, m3 = st.columns(3)
+m1.metric('Comuni selezionati', f'{len(selected):,}'.replace(',', '.'))
+m2.metric('Termini di ricerca', len(variants))
+m3.metric('Ricerche complessive previste', f'{len(selected)*len(variants):,}'.replace(',', '.'))
+st.caption('Le ricerche con sinonimi possono trovare attività aggiuntive. Il CSV elimina i duplicati e scarta le categorie non pertinenti.')
+if variants:
+    with st.expander('Vedi le parole effettivamente cercate'):
+        st.write(', '.join(variants))
 
-c_a, c_b, c_c = st.columns(3)
-c_a.metric('Comuni selezionati', f'{len(selected):,}'.replace(',', '.'))
-c_b.metric('Categorie', len(categories))
-c_c.metric('Ricerche nel piano', f'{len(selected)*len(categories):,}'.replace(',', '.'))
-st.caption('Lotto = nuove ricerche per avvio, non numero di aziende. Ripetendo la ricerca identica il motore può riprendere dal database temporaneo finché il server conserva i file.')
 if category_error:
     st.warning(category_error)
 if len(selected)*len(categories) > 2000:
@@ -196,7 +217,8 @@ if st.button('Avvia raccolta', type='primary', use_container_width=True, disable
     try:
         manager().submit(user=user, cities=selected, categories=categories,
                          batch=int(batch), workers=int(workers), pages=int(pages),
-                         filter_mode=mode)
+                         filter_mode=mode, depth=depth, exclude_chains=exclude_chains,
+                         extra_brands=extra_brands)
         st.rerun()
     except (ValueError, RuntimeError) as err:
         st.error(str(err))
