@@ -11,7 +11,7 @@ import time
 
 import streamlit as st
 
-from turbo_scraper import FITNESS, get_dataset
+from turbo_scraper import FITNESS, get_dataset, search_variants
 from web_backend import (JobManager, MAX_PAGES, MAX_SEARCHES, MAX_WORKERS,
                          build_categories, parse_geography, safe_csv_bytes,
                          select_geography, tail_log)
@@ -96,9 +96,9 @@ with st.sidebar:
         st.session_state.pop('authenticated_at', None)
         st.rerun()
     st.divider()
-    st.caption('Limiti cautelativi del piano gratuito: una ricerca alla volta, massimo 200 query per lotto, massimo 4 lavoratori. I dati non sono archivio permanente.')
+    st.caption('Il servizio gratuito può interrompere ricerche lunghe. Scarica il CSV appena disponibile.')
 
-st.title('Ricerca attività in Italia')
+st.title('Trova attività locali')
 st.write('Seleziona categorie e aree geografiche. Il programma esclude per impostazione predefinita le categorie non pertinenti e crea un CSV scaricabile.')
 
 try:
@@ -167,36 +167,48 @@ try:
 except ValueError as ex:
     categories, category_error = [], str(ex)
 
-st.subheader('3. Precisione e velocità')
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    batch = st.number_input('Ricerche per lotto', min_value=1, max_value=MAX_SEARCHES,
-                            value=60, step=10)
-with c2:
-    workers = st.slider('Ricerche parallele', 1, MAX_WORKERS, 2)
-with c3:
-    pages = st.slider('Pagine per ricerca', 1, MAX_PAGES, 2)
-with c4:
-    mode = st.selectbox('Filtro categoria', ['rigoroso', 'ampio'],
-                        help='Rigoroso: scarta le schede senza categoria verificabile.')
-
-c_a, c_b, c_c = st.columns(3)
-c_a.metric('Comuni selezionati', f'{len(selected):,}'.replace(',', '.'))
-c_b.metric('Categorie', len(categories))
-c_c.metric('Ricerche nel piano', f'{len(selected)*len(categories):,}'.replace(',', '.'))
-st.caption('Lotto = nuove ricerche per avvio, non numero di aziende. Ripetendo la ricerca identica il motore può riprendere dal database temporaneo finché il server conserva i file.')
+st.subheader('3. Come vuoi cercare?')
+st.caption('La modalità approfondita è già selezionata. Non devi impostare parametri tecnici.')
+depth = st.radio('Tipo di ricerca',
+    ['Approfondita', 'Equilibrata', 'Veloce'], index=0,
+    help='Approfondita cerca con sinonimi e più pagine. Su un solo comune e una sola categoria esamina anche zone diverse della città.')
+st.caption({
+    'Approfondita': 'Consigliata: più ricerche alternative, fino a 10 pagine per ricerca. Con un comune e una categoria controlla anche diverse zone della città.',
+    'Equilibrata': 'Un compromesso: due modi di cercare la stessa categoria e cinque pagine.',
+    'Veloce': 'Meno ricerche e meno pagine. Adatta per un primo controllo.',
+}[depth])
+exclude_chains = st.checkbox('Escludi grandi catene e franchising conosciuti', value=True)
+with st.expander('Preferenze facoltative'):
+    st.caption('Il riconoscimento delle catene è basato su nomi conosciuti, non su verifiche societarie. Alcune possono sfuggire.')
+    custom_brands = st.text_area('Altri marchi da escludere (facoltativo)',
+        placeholder='Un marchio per riga, per esempio: Nome Catena')
+    extra_brands = [x.strip() for x in custom_brands.replace('\n', ',').split(',') if x.strip()]
+    include_uncertain = st.checkbox('Includi anche attività dalla categoria incerta', value=False)
+mode = 'ampio' if include_uncertain else 'rigoroso'
+batch = {'Veloce': 80, 'Equilibrata': 60, 'Approfondita': 100}[depth]
+workers = 2
+pages = {'Veloce': 2, 'Equilibrata': 5, 'Approfondita': 10}[depth]
+variants = search_variants(categories, depth) if categories else []
+m1,m2 = st.columns(2)
+m1.metric('Comuni da analizzare', len(selected))
+m2.metric('Ricerche previste', len(selected)*len(variants))
+if len(selected)==1 and len(categories)==1:
+    st.info('Ricerca locale approfondita: dopo i risultati generali saranno esplorate anche diverse zone della città. I risultati saranno unificati.')
+elif selected:
+    st.caption('Su aree molto estese il sistema procede per gruppi: sul piano gratuito non può completare tutta Italia in un unico avvio.')
 if category_error:
     st.warning(category_error)
-if len(selected)*len(categories) > 2000:
+if len(selected)*len(variants) > 2000:
     st.info('Piano ampio: esegui più lotti piccoli. La modalità gratuita non garantisce che l’app continui a elaborare se il server viene sospeso.')
 
 job = manager().user_job(user)
 run_disabled = bool(category_error or not selected or not categories or (job and not job.done))
-if st.button('Avvia raccolta', type='primary', use_container_width=True, disabled=run_disabled):
+if st.button('Cerca attività', type='primary', use_container_width=True, disabled=run_disabled):
     try:
         manager().submit(user=user, cities=selected, categories=categories,
                          batch=int(batch), workers=int(workers), pages=int(pages),
-                         filter_mode=mode)
+                         filter_mode=mode, depth=depth, exclude_chains=exclude_chains,
+                         extra_brands=extra_brands)
         st.rerun()
     except (ValueError, RuntimeError) as err:
         st.error(str(err))
