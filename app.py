@@ -26,7 +26,9 @@ st.markdown('''<style>
 
 
 @st.cache_resource
-def manager() -> JobManager:
+def manager(cache_schema_version: int = 6) -> JobManager:
+    # Nuova istanza del gestore quando cambia l'interfaccia JobManager.
+    # Evita istanze incompatibili rimaste in cache dopo un deploy Streamlit.
     return JobManager()
 
 
@@ -210,8 +212,10 @@ if st.button('Cerca attività', type='primary', use_container_width=True, disabl
                          filter_mode=mode, depth=depth, exclude_chains=exclude_chains,
                          extra_brands=extra_brands)
         st.rerun()
-    except (ValueError, RuntimeError) as err:
-        st.error(str(err))
+    except (ValueError, RuntimeError, TypeError) as err:
+        st.error('Non è stato possibile avviare la ricerca.')
+        st.caption(f'Dettaglio tecnico: {type(err).__name__}: {str(err)[:300]}')
+        st.caption('Se hai appena aggiornato il sito, riavvia l’app da Streamlit Cloud.')
 
 st.divider()
 st.subheader('4. Stato e risultati')
