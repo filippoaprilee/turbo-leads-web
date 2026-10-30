@@ -182,7 +182,7 @@ with st.expander('Preferenze facoltative'):
     st.caption('Il riconoscimento delle catene è basato su nomi conosciuti, non su verifiche societarie. Alcune possono sfuggire.')
     custom_brands = st.text_area('Altri marchi da escludere (facoltativo)',
         placeholder='Un marchio per riga, per esempio: Nome Catena')
-    extra_brands = [x.strip() for x in custom_brands.replace('\\n', ',').split(',') if x.strip()]
+    extra_brands = [x.strip() for x in custom_brands.replace('\n', ',').split(',') if x.strip()]
     include_uncertain = st.checkbox('Includi anche attività dalla categoria incerta', value=False)
 mode = 'ampio' if include_uncertain else 'rigoroso'
 batch = {'Veloce': 80, 'Equilibrata': 60, 'Approfondita': 100}[depth]
