@@ -96,9 +96,9 @@ with st.sidebar:
         st.session_state.pop('authenticated_at', None)
         st.rerun()
     st.divider()
-    st.caption('Limiti cautelativi del piano gratuito: una ricerca alla volta, massimo 200 query per lotto, massimo 4 lavoratori. I dati non sono archivio permanente.')
+    st.caption('Il servizio gratuito può interrompere ricerche lunghe. Scarica il CSV appena disponibile.')
 
-st.title('Trova attività indipendenti')
+st.title('Trova attività locali')
 st.write('Seleziona categorie e aree geografiche. Il programma esclude per impostazione predefinita le categorie non pertinenti e crea un CSV scaricabile.')
 
 try:
@@ -167,53 +167,43 @@ try:
 except ValueError as ex:
     categories, category_error = [], str(ex)
 
-st.subheader('3. Profondità e filtri')
-st.caption('Lascia i valori consigliati se non conosci le impostazioni tecniche.')
-depth = st.radio('Quanto a fondo vuoi cercare?',
-    ['Veloce', 'Equilibrata', 'Approfondita'], index=1, horizontal=True)
+st.subheader('3. Come vuoi cercare?')
+st.caption('La modalità approfondita è già selezionata. Non devi impostare parametri tecnici.')
+depth = st.radio('Tipo di ricerca',
+    ['Approfondita', 'Equilibrata', 'Veloce'], index=0,
+    help='Approfondita cerca con sinonimi e più pagine. Su un solo comune e una sola categoria esamina anche zone diverse della città.')
 st.caption({
-    'Veloce': 'Una ricerca per categoria e comune. Rapida, ma può perdere attività.',
-    'Equilibrata': 'Due varianti di ricerca, 5 pagine predefinite e dettagli aggiuntivi. Consigliata.',
-    'Approfondita': 'Fino a 4 varianti per categoria, 10 pagine e recupero dettagli. Richiede più tempo.',
+    'Approfondita': 'Consigliata: più ricerche alternative, fino a 10 pagine per ricerca. Con un comune e una categoria controlla anche diverse zone della città.',
+    'Equilibrata': 'Un compromesso: due modi di cercare la stessa categoria e cinque pagine.',
+    'Veloce': 'Meno ricerche e meno pagine. Adatta per un primo controllo.',
 }[depth])
-with st.expander('Filtra catene e franchising', expanded=True):
-    exclude_chains = st.checkbox('Escludi marchi e grandi catene conosciute', value=True)
-    st.caption('Esempi: McFIT, FitActive, Basic-Fit, Virgin Active, Decathlon, Terranova. Il filtro riconosce soltanto marchi noti nell’elenco: non identifica con certezza tutti i franchising.')
+exclude_chains = st.checkbox('Escludi grandi catene e franchising conosciuti', value=True)
+with st.expander('Preferenze facoltative'):
+    st.caption('Il riconoscimento delle catene è basato su nomi conosciuti, non su verifiche societarie. Alcune possono sfuggire.')
     custom_brands = st.text_area('Altri marchi da escludere (facoltativo)',
-        placeholder='Un nome per riga, oppure separati da virgole',
-        help='Inserisci nomi di catene specifici, non parole come palestra o fitness.')
+        placeholder='Un marchio per riga, per esempio: Nome Catena')
     extra_brands = [x.strip() for x in custom_brands.replace('\n', ',').split(',') if x.strip()]
-    filter_label = st.selectbox('Qualità dei risultati',
-        ['Solo categorie pertinenti (consigliato)', 'Includi anche attività dubbie'])
-    mode = 'rigoroso' if filter_label.startswith('Solo') else 'ampio'
-with st.expander('Impostazioni tecniche (facoltative)'):
-    st.caption('Un lotto indica quante ricerche eseguire, NON quante aziende trovare.')
-    batch = st.number_input('Ricerche per lotto', min_value=1, max_value=MAX_SEARCHES,
-                            value={'Veloce': 100, 'Equilibrata': 60, 'Approfondita': 25}[depth],
-                            step=5, help='Ripeti la stessa ricerca per proseguire finché i dati temporanei restano sul server.')
-    workers = st.slider('Ricerche contemporanee', 1, MAX_WORKERS, 2,
-        help='Aumentare questo valore può causare limiti temporanei sulla rete.')
-    pages = st.slider('Pagine da consultare per ricerca', 1, MAX_PAGES,
-        {'Veloce': 2, 'Equilibrata': 5, 'Approfondita': 10}[depth],
-        help='Più pagine possono aumentare i risultati, ma non garantiscono copertura completa.')
+    include_uncertain = st.checkbox('Includi anche attività dalla categoria incerta', value=False)
+mode = 'ampio' if include_uncertain else 'rigoroso'
+batch = {'Veloce': 80, 'Equilibrata': 60, 'Approfondita': 100}[depth]
+workers = 2
+pages = {'Veloce': 2, 'Equilibrata': 5, 'Approfondita': 10}[depth]
 variants = search_variants(categories, depth) if categories else []
-m1, m2, m3 = st.columns(3)
-m1.metric('Comuni selezionati', f'{len(selected):,}'.replace(',', '.'))
-m2.metric('Termini di ricerca', len(variants))
-m3.metric('Ricerche complessive previste', f'{len(selected)*len(variants):,}'.replace(',', '.'))
-st.caption('Le ricerche con sinonimi possono trovare attività aggiuntive. Il CSV elimina i duplicati e scarta le categorie non pertinenti.')
-if variants:
-    with st.expander('Vedi le parole effettivamente cercate'):
-        st.write(', '.join(variants))
-
+m1,m2 = st.columns(2)
+m1.metric('Comuni da analizzare', len(selected))
+m2.metric('Ricerche previste', len(selected)*len(variants))
+if len(selected)==1 and len(categories)==1:
+    st.info('Ricerca locale approfondita: dopo i risultati generali saranno esplorate anche diverse zone della città. I risultati saranno unificati.')
+elif selected:
+    st.caption('Su aree molto estese il sistema procede per gruppi: sul piano gratuito non può completare tutta Italia in un unico avvio.')
 if category_error:
     st.warning(category_error)
-if len(selected)*len(categories) > 2000:
+if len(selected)*len(variants) > 2000:
     st.info('Piano ampio: esegui più lotti piccoli. La modalità gratuita non garantisce che l’app continui a elaborare se il server viene sospeso.')
 
 job = manager().user_job(user)
 run_disabled = bool(category_error or not selected or not categories or (job and not job.done))
-if st.button('Avvia raccolta', type='primary', use_container_width=True, disabled=run_disabled):
+if st.button('Cerca attività', type='primary', use_container_width=True, disabled=run_disabled):
     try:
         manager().submit(user=user, cities=selected, categories=categories,
                          batch=int(batch), workers=int(workers), pages=int(pages),
