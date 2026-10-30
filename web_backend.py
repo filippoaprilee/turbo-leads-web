@@ -117,6 +117,8 @@ class Job:
     extra_brands: list[str]
     search_count: int
     n_cities: int
+    deep_local: bool
+    selected_cities: list[dict]
     filter_mode: str
     workers: int
     pages: int
@@ -165,12 +167,14 @@ class JobManager:
             # Cartelle per utente: ricerche uguali di utenti diversi non si sovrascrivono.
             user_slug = hashlib.sha256(user.encode()).hexdigest()[:12]
             search_categories = core.search_variants(categories, depth)
+            deep_local = len(cities) == 1 and len(categories) == 1
             base, dest = core.make_plan(cities, search_categories, f'web_{user_slug}_{depth.lower()}_p{pages}')
             job = Job(user=user, id=dest.stem, name=dest.stem,
                       base=base, dest=dest, categories=categories,
                       search_categories=search_categories, depth=depth,
                       exclude_chains=exclude_chains, extra_brands=extra_brands,
                       search_count=len(cities)*len(search_categories), n_cities=len(cities),
+                      deep_local=deep_local, selected_cities=list(cities),
                       filter_mode=filter_mode, batch=batch, workers=workers, pages=pages,
                       log_file=base/'motore_web.log')
             self.jobs[user] = job
@@ -255,12 +259,57 @@ raise SystemExit(engine.run(settings))
                     break
                 self._update(job, raw, rejected=None)
             exit_code = job.process.wait()
+        # Per una ricerca mirata in una sola città esegue anche celle geografiche.
+        # La scansione per griglia non è adatta a lanciare tutta Italia sul
+        # piano gratuito: richiede molte più richieste e può essere limitata.
+        if job.deep_local and not job.cancel.is_set() and exit_code == 0:
+            city = job.selected_cities[0]
+            category = job.categories[0]
+            with job.lock:
+                job.status = f'Esploro anche le zone di {city["name"]}'
+            grid_cmd = [
+                sys.executable, str(launcher), str(core.ENGINE),
+                'scrape', '--category', category,
+                '--location', f'{city["name"]}, {city["prov"]}, Italia',
+                '--all', '--cell-km', '4', '--radius-km', '5',
+                '--no-emails', '--no-details',
+                '--db', str(job.base/'progress.sqlite3'),
+                '--out', str(raw), '--reviews-out', str(job.base/'reviews.csv'),
+                '--workers', '2', '--max-pages', '6',
+                '--lang', 'it', '--gl', 'it',
+                '--min-interval', '1.0', '--delay-min', '1.2',
+                '--delay-max', '3.0', '--direct',
+            ]
+            with job.log_file.open('ab') as logfile:
+                logfile.write(b'\n--- Ricerca territoriale per zone ---\n')
+                logfile.flush()
+                job.process = subprocess.Popen(
+                    grid_cmd, cwd=core.ENGINE, stdout=logfile,
+                    stderr=subprocess.STDOUT,
+                    env=dict(os.environ, TURBO_DETAILS='0'),
+                )
+                while job.process.poll() is None:
+                    if job.cancel.wait(4):
+                        job.process.terminate()
+                        try:
+                            job.process.wait(timeout=12)
+                        except subprocess.TimeoutExpired:
+                            job.process.kill()
+                        break
+                    self._update(job, raw, rejected=None)
+                grid_exit = job.process.wait()
+                if grid_exit != 0 and not job.cancel.is_set():
+                    with job.lock:
+                        job.error = ('Ricerca a zone non completata: rimangono '
+                                     'disponibili i risultati della ricerca generale. '
+                                     'Verifica il log tecnico.')
+            self._update(job, raw, rejected=None)
         self._update(job, raw, rejected=rejected)
         with job.lock:
             if job.cancel.is_set():
                 job.status = 'Interrotto (CSV disponibile)'
             elif exit_code == 0:
-                job.status = 'Completato'
+                job.status = 'Completato (risultati disponibili)'
             else:
                 job.status = f'Motore terminato con errore ({exit_code})'
                 job.error = (job.log_file.read_text(encoding='utf-8', errors='replace')[-1200:]
