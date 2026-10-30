@@ -79,7 +79,8 @@ class EngineWorkflowTest(unittest.TestCase):
             (job_base/'locations').mkdir()
             dest = results/'risultati.csv'
             job = Job(user='amico', id='sample', name='sample', base=job_base, dest=dest,
-                      categories=['palestre'], search_count=1, n_cities=1,
+                      categories=['palestre'], search_categories=['palestre'], depth='Veloce',
+                      exclude_chains=False, extra_brands=[], search_count=1, n_cities=1,
                       filter_mode='rigoroso', workers=2, pages=1, batch=1,
                       log_file=job_base/'log.txt')
             class FakeProc:

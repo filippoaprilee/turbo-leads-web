@@ -153,6 +153,70 @@ def category_aliases(request: str) -> tuple[str, ...]:
     return CATEGORY_ALIASES.get(request, (request,))
 
 
+# Elenco conservativo di marchi e catene (personalizzabile dall'interfaccia).
+DEFAULT_BRANDS = (
+    'McFIT', 'FitActive', 'Basic-Fit', 'Virgin Active', 'Anytime Fitness',
+    'FitExpress', 'FitUp', 'Fit & Go', '20Hours', 'Curves', 'F45 Training',
+    'Orangetheory Fitness', 'Fit and Go', 'Decathlon', 'OVS', 'Terranova',
+    'Zara', 'H&M', 'Calzedonia', 'Intimissimi', 'Tezenis', 'KIKO Milano',
+    'Douglas', 'Sephora', 'Tigota', 'Acqua e Sapone', 'MediaWorld', 'Unieuro',
+    'Euronics', 'Trony', 'Conad', 'Carrefour', 'Esselunga', 'Eurospin',
+    'ALDI', 'Lidl', 'Penny Market', 'Pam Panorama', 'McDonald',
+    'Burger King', 'KFC', 'Subway', 'Roadhouse', 'Old Wild West',
+    'La Piadineria',
+)
+# Ricerca con sinonimi, applicando comunque il filtro finale originale.
+SEARCH_EXPANSIONS = {
+    'palestra': ('palestra', 'centro fitness', 'gym', 'sala pesi'),
+    'centro fitness': ('centro fitness', 'palestra', 'fitness club'),
+    'fisioterapista': ('fisioterapista', 'studio fisioterapia', 'centro fisioterapia'),
+    'personal trainer': ('personal trainer', 'studio personal training', 'allenamento personalizzato'),
+    'studio pilates': ('studio pilates', 'pilates'),
+    'studio yoga': ('studio yoga', 'yoga'),
+    'centro estetico': ('centro estetico', 'estetista', 'istituto di bellezza'),
+    'nutrizionista': ('nutrizionista', 'dietista', 'studio nutrizione'),
+    'medico': ('studio medico', 'medico'),
+    'autonoleggio': ('autonoleggio', 'noleggio auto', 'car rental'),
+    'centro sportivo': ('centro sportivo', 'impianto sportivo'),
+    'ristorante': ('ristorante', 'trattoria', 'osteria'),
+    'pizzeria': ('pizzeria', 'pizza restaurant'),
+    'parrucchiere': ('parrucchiere', 'salone parrucchieri'),
+}
+
+
+def search_variants(categories: list[str], depth: str) -> list[str]:
+    """Espande le categorie con pochi sinonimi distinti."""
+    if depth not in ('Veloce', 'Equilibrata', 'Approfondita'):
+        raise ValueError('Profondita non valida')
+    count = {'Veloce': 1, 'Equilibrata': 2, 'Approfondita': 4}[depth]
+    result = []
+    seen = set()
+    for category in categories:
+        aliases = (category,) + SEARCH_EXPANSIONS.get(canonical_category(category), ())
+        unique_options = list(dict.fromkeys(normalize_label(x) for x in aliases))
+        lookup = {normalize_label(x): x for x in reversed(aliases)}
+        lookup[normalize_label(category)] = category
+        for variant in [lookup[x] for x in unique_options[:count]]:
+            key = normalize_label(variant)
+            if key not in seen:
+                result.append(variant)
+                seen.add(key)
+    return result
+
+
+def brand_verdict(row: dict, exclude_chains: bool = True,
+                  extra_brands: list[str] | None = None) -> tuple[bool, str]:
+    """Controlla solo nomi di marchi noti o esplicitamente inseriti."""
+    if not exclude_chains and not extra_brands:
+        return True, 'Filtro marchi disattivato'
+    name = normalize_label(row.get('name') or '')
+    brands = (DEFAULT_BRANDS if exclude_chains else ()) + tuple(extra_brands or ())
+    for brand in brands:
+        if has_phrase(name, brand):
+            return False, f'Catena/marchio escluso: {brand}'
+    return True, 'Nessun marchio escluso riconosciuto'
+
+
 def category_verdict(row: dict, requested_categories: list[str], mode: str = 'rigoroso') -> tuple[bool, str]:
     """Accetta solo categorie Maps pertinenti, non solo la query cercata.
 
@@ -202,14 +266,19 @@ def category_verdict(row: dict, requested_categories: list[str], mode: str = 'ri
     return False, f'Categoria Maps non pertinente: {raw_cat[:100]}'
 
 
-def split_by_relevance(rows: list[dict], categories: list[str], mode='rigoroso'):
+def split_by_relevance(rows: list[dict], categories: list[str], mode='rigoroso',
+                       exclude_chains: bool = False, extra_brands: list[str] | None = None):
     kept, rejected = [], []
     for row in rows:
         if not (row.get('name') or '').strip():
             continue
         match, reason = category_verdict(row, categories, mode)
         if match:
-            kept.append(row)
+            brand_ok, brand_reason = brand_verdict(row, exclude_chains, extra_brands)
+            if brand_ok:
+                kept.append(row)
+            else:
+                rejected.append((row, brand_reason))
         else:
             rejected.append((row, reason))
     return kept, rejected
@@ -386,9 +455,11 @@ def read_raw(raw: Path):
 
 def write_normalized(rows: list[dict], dest: Path, emails: dict | None = None,
                      categories: list[str] | None = None, filter_mode: str = 'rigoroso',
-                     rejected_file: Path | None = None):
+                     rejected_file: Path | None = None,
+                     exclude_chains: bool = False, extra_brands: list[str] | None = None):
     emails = emails or {}
-    accepted, rejected = split_by_relevance(rows, categories or [], filter_mode)
+    accepted, rejected = split_by_relevance(rows, categories or [], filter_mode,
+                                            exclude_chains, extra_brands)
     existing = set()
     entries = []
     for row in accepted:
@@ -398,7 +469,7 @@ def write_normalized(rows: list[dict], dest: Path, emails: dict | None = None,
         website = (row.get('website') or '').strip()
         email = (emails.get(website) or row.get('email') or '').strip()
         place_id = (row.get('place_id') or row.get('google_maps_url') or '').strip()
-        duplicate_key = place_id if place_id else (name.casefold(), city.casefold(), phone)
+        duplicate_key = place_id if place_id else (normalize_label(name), normalize_label(city), phone)
         if duplicate_key in existing:
             continue
         existing.add(duplicate_key)
