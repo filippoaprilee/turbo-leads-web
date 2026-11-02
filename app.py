@@ -139,7 +139,7 @@ with st.sidebar:
         st.session_state.pop('authenticated_at', None)
         st.rerun()
     st.divider()
-    st.caption('Il servizio gratuito può interrompere ricerche lunghe. Scarica il CSV appena disponibile.')
+    st.caption('Scarica un backup ZIP al termine di ogni sessione: il server gratuito può essere azzerato.')
 
 # Prima dei widget: carica preferenze salvate (URL persistente, file locale best effort).
 profile_path = core.STATE / 'profili' / (hashlib.sha256(user.encode()).hexdigest()[:16] + '.json')
@@ -396,39 +396,10 @@ def live_job():
                 st.rerun()
             except (StorageError, RuntimeError, ValueError) as ex:
                 st.error(str(ex))
-    if manager().storage:
-        if current.github_saved_at:
-            st.success('Ultimo backup GitHub privato: ' + time.strftime(
-                '%d/%m/%Y %H:%M', time.localtime(current.github_saved_at)))
-        elif not done:
-            st.caption('Backup automatico in preparazione: attendo i risultati del primo gruppo.')
-        if current.github_error:
-            st.error('Backup GitHub non riuscito: ' + current.github_error)
-    if manager().archive:
-        if current.cloud_saved_at:
-            st.caption(f'Ultimo backup permanente R2: {time.strftime("%d/%m/%Y %H:%M", time.localtime(current.cloud_saved_at))}')
-        elif not done:
-            st.caption('Backup R2 non ancora effettuato: attendo il primo checkpoint.')
-        else:
-            st.warning('Nessun checkpoint R2 confermato per questa ricerca.')
-        if current.cloud_error:
-            st.error('Errore nel backup cloud: ' + current.cloud_error)
-    elif not manager().storage:
-        st.warning('I risultati restano temporanei finché non scarichi il backup ZIP.')
-    if (current.base / 'progress.sqlite3').exists():
-        if st.button('Prepara backup ZIP completo della ricerca', key='prepare_backup'):
-            try:
-                st.session_state['_ready_zip'] = make_checkpoint(
-                    current.base, current.dest, user, current.id)
-                st.session_state['_ready_zip_id'] = current.id
-            except (RuntimeError, ValueError, OSError) as exc:
-                st.error('Backup ZIP non disponibile: ' + str(exc)[:240])
-        if (st.session_state.get('_ready_zip_id') == current.id
-                and st.session_state.get('_ready_zip')):
-            st.download_button('Scarica backup ZIP per riprendere dopo il riavvio',
-                data=st.session_state['_ready_zip'],
-                file_name=current.id + '_backup.zip', mime='application/zip',
-                use_container_width=True)
+    if done:
+        st.caption('Scarica il nuovo backup ZIP dalla sezione precedente per conservare i progressi.')
+    else:
+        st.caption('Finché la ricerca è attiva, il server mantiene i risultati in memoria temporanea.')
     if current.dest.exists():
         payload = safe_csv_bytes(current.dest)
         if payload:
