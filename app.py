@@ -313,106 +313,41 @@ if st.button('Avvia / continua ricerca', type='primary', use_container_width=Tru
 
 
 
-st.subheader('Backup delle ricerche — senza costi aggiuntivi')
-if manager().storage:
-    st.success('Backup automatico GitHub PRIVATO attivo. I checkpoint vengono salvati dopo ogni gruppo e recuperati automaticamente per lo stesso piano.')
-    if st.button('Mostra le ricerche salvate su GitHub'):
+st.subheader('Backup e ripristino — nessun servizio esterno')
+st.info('Il server gratuito può perdere i file. A fine sessione scarica un archivio ZIP sul tuo computer: contiene risultati, stato delle ricerche e impostazioni.')
+
+saved_job = manager().user_job(user)
+if saved_job and saved_job.done and (saved_job.base / 'progress.sqlite3').exists():
+    if st.button('Prepara backup ZIP completo', use_container_width=True):
         try:
-            st.session_state['_github_plans'] = manager().storage.list_plans(user)
-        except (RuntimeError, ValueError, OSError) as ex:
-            st.error(str(ex))
-    saved_options = st.session_state.get('_github_plans', [])
-    if saved_options:
-        saved_id = st.selectbox('Scegli una ricerca già archiviata', saved_options, key='github_plan')
-        if st.button('Recupera ricerca e CSV da GitHub'):
-            if manager().active_id:
-                st.error('Interrompi prima la ricerca attiva.')
-            else:
-                try:
-                    remote_data = manager().storage.load(user, saved_id)
-                    if remote_data is None:
-                        raise ValueError('Backup non trovato')
-                    recovered = restore_checkpoint(remote_data, user, expected_id=saved_id)
-                    st.session_state['_restored_backup_id'] = recovered['plan_id']
-                    st.success('Checkpoint ripristinato: puoi avviare la stessa ricerca per continuarla.')
-                except (RuntimeError, ValueError, OSError) as ex:
-                    st.error(str(ex))
-elif getattr(manager(), 'storage_error', ''):
-    st.error('Archivio GitHub non operativo: ' + manager().storage_error)
+            with st.spinner('Creo una copia del database…'):
+                st.session_state['_portable_zip'] = manager().create_portable_backup(user, profile)
+                st.session_state['_portable_zip_id'] = saved_job.id
+        except (ValueError, RuntimeError, OSError) as err:
+            st.error(f'Backup non riuscito: {str(err)[:220]}')
+    if st.session_state.get('_portable_zip_id') == saved_job.id and st.session_state.get('_portable_zip'):
+        st.download_button('Scarica ZIP: risultati e avanzamento',
+            data=st.session_state['_portable_zip'], file_name=saved_job.id + '_backup.zip',
+            mime='application/zip', use_container_width=True)
 else:
-    st.info('Backup automatico non ancora configurato. Per ora usa lo ZIP scaricabile qui sotto; dopo il riavvio del server dovrai ricaricarlo.')
+    st.caption('Termina o interrompi la ricerca per abilitare il download del backup.')
 
-with st.expander('Ripristina un backup ZIP scaricato in precedenza'):
-    uploaded_checkpoint = st.file_uploader('Seleziona il backup della ricerca', type=['zip'], key='checkpoint_upload')
-    if st.button('Ripristina questo ZIP'):
-        if manager().active_id:
-            st.error('Interrompi prima la ricerca in corso.')
-        elif not uploaded_checkpoint:
-            st.warning('Seleziona prima il file ZIP.')
-        else:
-            try:
-                restored = restore_checkpoint(uploaded_checkpoint.getvalue(), user)
-                st.session_state['_restored_backup_id'] = restored['plan_id']
-                st.success('Stato e CSV ripristinati. Seleziona le stesse categorie e il territorio per continuare.')
-            except (ValueError, OSError, KeyError, Exception) as exc:
-                st.error(f'Backup non valido: {str(exc)[:220]}')
-restored_id = st.session_state.get('_restored_backup_id', '')
-if restored_id:
-    restored_csv = core.RESULTS / (restored_id + '.csv')
-    if restored_csv.exists():
-        st.download_button('Scarica CSV recuperato dal backup',
-            data=safe_csv_bytes(restored_csv), file_name=restored_id + '.csv',
-            mime='text/csv', use_container_width=True)
-st.caption('Solo GitHub privato è adatto al salvataggio automatico. Non usare il repository pubblico del codice per archiviare contatti.')
-
-st.subheader('Archivio permanente delle ricerche')
-if manager().archive:
-    st.success('Cloudflare R2 configurato. Le copie del database vengono archiviate durante la ricerca e a fine gruppo.')
-    col_test, col_reload = st.columns(2)
-    with col_test:
-        if st.button('Verifica collegamento R2', use_container_width=True):
-            try:
-                manager().archive.probe()
-                st.success('Collegamento riuscito: bucket raggiungibile.')
-            except StorageError as err:
-                st.error(str(err))
-    with col_reload:
-        if st.button('Aggiorna elenco ricerche salvate', use_container_width=True):
-            st.cache_data.clear()
+with st.expander('Ripristina una ricerca dal tuo ZIP'):
+    uploaded_zip = st.file_uploader('Seleziona il backup ZIP', type=['zip'], key='portable_upload')
+    if st.button('Ripristina dati e impostazioni', disabled=uploaded_zip is None):
+        try:
+            recovered_job, saved_preferences = manager().restore_portable_backup(
+                user, uploaded_zip.getvalue())
+            st.session_state['_portable_preferences_to_restore'] = saved_preferences
+            st.session_state['_restored_backup_id'] = recovered_job.id
+            st.session_state.pop('_portable_zip', None)
             st.rerun()
+        except (ValueError, RuntimeError, OSError, KeyError) as err:
+            st.error(f'Ripristino non riuscito: {str(err)[:230]}')
+    if st.session_state.get('_restored_backup_id'):
+        st.success('Backup ripristinato. Prosegui dalla sezione Stato e risultati.')
 
-    @st.cache_data(ttl=90, show_spinner=False)
-    def archived_searches(username: str, cache_version: int = 1):
-        return manager().archived_jobs(username)
-
-    try:
-        saved_jobs = archived_searches(user)
-        if saved_jobs:
-            options = {
-                j['id']: (f"{', '.join(j.get('categories', []))[:70]} — "
-                          f"{j.get('n_cities', len(j.get('cities', [])))} comuni — "
-                          f"{j.get('completed', 0)}/{j.get('search_count', '?')} ricerche")
-                for j in saved_jobs
-            }
-            selected_job = st.selectbox(
-                'Ricerche già archiviate', options=list(options),
-                format_func=lambda x: options[x])
-            if st.button('Ripristina questa ricerca e il suo CSV',
-                         use_container_width=True):
-                try:
-                    manager().restore_saved(user, selected_job)
-                    st.rerun()
-                except (StorageError, RuntimeError, ValueError) as ex:
-                    st.error(str(ex))
-        else:
-            st.caption('Nessuna ricerca archiviata: i nuovi checkpoint compariranno qui.')
-    except StorageError as ex:
-        st.error(f'Impossibile consultare l’archivio R2: {ex}')
-else:
-    if getattr(manager(), 'archive_error', ''):
-        st.error('Configurazione R2 incompleta: ' + manager().archive_error)
-    if not manager().storage:
-        st.caption('Nessun archivio automatico configurato: per ora utilizza il backup ZIP. Non serve configurare R2.')
+st.caption('Il file contiene contatti aziendali: conservalo in modo riservato e aggiornalo dopo ogni sessione.')
 
 st.divider()
 st.subheader('4. Stato e risultati')
