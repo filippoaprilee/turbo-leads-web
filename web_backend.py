@@ -337,6 +337,10 @@ class JobManager:
                 raise ValueError('Il backup supera la dimensione consentita di 60 MB.')
             try:
                 with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                    if len(zf.infolist()) > 500 or sum(x.file_size for x in zf.infolist()) > 450 * 1024 * 1024:
+                        raise ValueError('Archivio ZIP troppo grande.')
+                    if zf.getinfo('manifest.json').file_size > 2 * 1024 * 1024:
+                        raise ValueError('Manifest del backup troppo grande.')
                     manifest = json.loads(zf.read('manifest.json').decode('utf-8'))
             except (OSError, ValueError, KeyError, zipfile.BadZipFile) as exc:
                 raise ValueError('Il file non è un backup TURBO valido.') from exc
