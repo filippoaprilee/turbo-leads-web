@@ -34,8 +34,13 @@ st.markdown('''<style>
 def manager(cache_schema_version: int = 8) -> JobManager:
     # Cambio schema: non riutilizzare oggetti JobManager di versioni precedenti.
     config = dict(st.secrets.get('r2', {}))
-    archive = R2Archive(config) if config else None
-    return JobManager(archive=archive)
+    try:
+        archive = R2Archive(config) if config else None
+        return JobManager(archive=archive)
+    except StorageError as err:
+        fallback = JobManager(archive=None)
+        fallback.archive_error = str(err)
+        return fallback
 
 
 @st.cache_resource
@@ -367,6 +372,8 @@ if manager().archive:
     except StorageError as ex:
         st.error(f'Impossibile consultare l’archivio R2: {ex}')
 else:
+    if getattr(manager(), 'archive_error', ''):
+        st.error('Configurazione R2 incompleta: ' + manager().archive_error)
     st.warning('Archivio permanente non collegato: il server può perdere risultati e avanzamento quando viene riavviato.')
     st.caption('Crea un bucket R2 privato dedicato e configura la sezione [r2] nei Secrets di Streamlit. Le credenziali non vanno su GitHub.')
 
