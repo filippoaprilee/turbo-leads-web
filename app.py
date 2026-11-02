@@ -32,30 +32,8 @@ st.markdown('''<style>
 
 
 @st.cache_resource
-def manager(cache_schema_version: int = 9) -> JobManager:
-    r2_config = dict(st.secrets.get('r2', {}))
-    github_config = dict(st.secrets.get('github_storage', {}))
-    archive, storage = None, None
-    r2_error, storage_error = '', ''
-    if r2_config:
-        try:
-            archive = R2Archive(r2_config)
-        except StorageError as exc:
-            r2_error = str(exc)
-    if github_config:
-        try:
-            storage = GitHubStorage(
-                repo=str(github_config.get('repo', '')),
-                token=str(github_config.get('token', '')),
-                branch=str(github_config.get('branch', 'main'))
-            )
-            storage.verify_private()
-        except (RuntimeError, ValueError, OSError) as exc:
-            storage, storage_error = None, str(exc)
-    obj = JobManager(archive=archive, storage=storage)
-    obj.archive_error = r2_error
-    obj.storage_error = storage_error
-    return obj
+def manager(cache_schema_version: int = 10) -> JobManager:
+    return JobManager()
 
 
 @st.cache_resource
