@@ -62,7 +62,8 @@ class R2Archive:
 
     def probe(self) -> None:
         try:
-            self.client.head_bucket(Bucket=self.bucket)
+            self.client.list_objects_v2(Bucket=self.bucket,
+                                        Prefix=self.prefix + '/', MaxKeys=1)
         except (ClientError, BotoCoreError) as exc:
             raise StorageError("Connessione R2 non riuscita. Verifica bucket e permessi.") from exc
 
