@@ -155,13 +155,12 @@ if st.session_state.get('_prefs_source') != source_id:
     for k, v in PREF_DEFAULTS.items():
         st.session_state.setdefault(k, v)
     apply_pref(stored)
-    if manager().archive:
-        try:
-            apply_pref(manager().archive.load_profile(user))
-        except StorageError as exc:
-            st.warning(f'Preferenze cloud non recuperate: {exc}')
     apply_pref(read_pref_token(url_token))
     st.session_state['_prefs_source'] = source_id
+
+pending = st.session_state.pop('_portable_preferences_to_restore', None)
+if isinstance(pending, dict):
+    apply_pref(pending)
 
 with st.expander('Preferenze salvate: importa o ripristina'):
     uploaded_profile = st.file_uploader('Carica un profilo JSON salvato', type=['json'], key='profile_upload')
@@ -290,15 +289,7 @@ with pref_cols[0]:
                                 encoding='utf-8')
         st.query_params['preset'] = pref_token(profile)
         st.session_state['_prefs_source'] = st.query_params['preset']
-        if manager().archive:
-            try:
-                manager().archive.save_profile(user, profile)
-                st.success('Preferenze salvate in Cloudflare R2. Disponibili anche dopo un riavvio.')
-            except StorageError as exc:
-                st.error(f'Cloud R2 non aggiornato: {exc}')
-                st.info('Puoi utilizzare comunque il segnalibro o scaricare il profilo JSON.')
-        else:
-            st.warning('Profilo salvato soltanto in locale/URL: collega R2 per un salvataggio permanente nel cloud.')
+        st.success('Preferenze salvate nell’indirizzo della pagina. Aggiungila ai preferiti del browser.')
 with pref_cols[1]:
     st.download_button('Scarica profilo JSON', data=json.dumps(
         profile, ensure_ascii=False, indent=2).encode('utf-8'),
