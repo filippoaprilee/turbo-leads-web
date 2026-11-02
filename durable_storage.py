@@ -15,22 +15,36 @@ from datetime import datetime, timezone
 from pathlib import Path
 import turbo_scraper as core
 
-MAX_ARCHIVE = 15 * 1024 * 1024
-MAX_EXTRACTED = 180 * 1024 * 1024
+MAX_ARCHIVE = 60 * 1024 * 1024
+MAX_EXTRACTED = 450 * 1024 * 1024
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 NAME_PATTERN = re.compile(r"^web_[0-9a-f]{12}_[a-z]+_p[0-9]+_[a-z0-9_]+_[0-9a-f]{10}$")
 
 def user_tag(username: str) -> str:
     return hashlib.sha256(username.encode("utf-8")).hexdigest()[:16]
 
-def make_checkpoint(base: Path, dest: Path, username: str, plan_id: str) -> bytes:
-    """Backup online sicuro anche con SQLite WAL."""
+def make_checkpoint(base: Path, dest: Path, username: str, plan_id: str,
+                    run_config: dict | None = None,
+                    preferences: dict | None = None) -> bytes:
+    """ZIP portatile con snapshot SQLite, risultati e configurazione.
+
+    Se lo stesso archivio è usato per il backup remoto, i campi
+    aggiuntivi restano opzionali per compatibilità con la vecchia versione.
+    """
     if not NAME_PATTERN.fullmatch(plan_id):
         raise ValueError("Identificativo piano non valido")
     if not (base / "progress.sqlite3").exists():
         raise ValueError("Non esiste uno stato di ricerca da salvare")
     manifest = {"version": 1, "user_tag": user_tag(username), "plan_id": plan_id,
                 "created": datetime.now(timezone.utc).isoformat()}
+    if run_config is not None:
+        if not isinstance(run_config, dict):
+            raise ValueError("Configurazione del piano non valida")
+        manifest["run_config"] = run_config
+    if preferences is not None:
+        if not isinstance(preferences, dict):
+            raise ValueError("Preferenze non valide")
+        manifest["preferences"] = preferences
     with tempfile.TemporaryDirectory() as tmp:
         tempdb = Path(tmp) / "progress.sqlite3"
         src = sqlite3.connect(str(base / "progress.sqlite3"), timeout=10)
@@ -59,13 +73,13 @@ def make_checkpoint(base: Path, dest: Path, username: str, plan_id: str) -> byte
                 archive.write(reject, "excluded.csv")
         payload = buffer.getvalue()
     if len(payload) > MAX_ARCHIVE:
-        raise ValueError("Backup oltre 15 MB. Scarica il CSV e suddividi la ricerca.")
+        raise ValueError("Backup oltre 60 MB. Scarica i risultati CSV e dividi la ricerca in più territori.")
     return payload
 
 def restore_checkpoint(payload: bytes, username: str, *, expected_id: str | None = None) -> dict:
     """Ripristina solo un backup valido per l'utente e il piano."""
     if len(payload) > MAX_ARCHIVE:
-        raise ValueError("Backup oltre 15 MB")
+        raise ValueError("Backup oltre 60 MB")
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         infos = archive.infolist()
         if len(infos) > 400 or sum(i.file_size for i in infos) > MAX_EXTRACTED:
