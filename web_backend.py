@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 
 import turbo_scraper as core
+from r2_archive import R2Archive, StorageError
 
 
 MAX_CATEGORIES = 30
@@ -131,6 +132,8 @@ class Job:
     rejected: int = 0
     raw_count: int = 0
     started: float = field(default_factory=time.time)
+    cloud_saved_at: int = 0
+    cloud_error: str = ''
     ended: float = 0
     process: subprocess.Popen | None = field(default=None, repr=False)
     cancel: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -139,7 +142,8 @@ class Job:
 
 
 class JobManager:
-    def __init__(self):
+    def __init__(self, archive: R2Archive | None = None):
+        self.archive = archive
         self.lock = threading.RLock()
         self.jobs: dict[str, Job] = {}
         self.active_id: str | None = None  # Un job alla volta: hosting gratuito e file condivisi
@@ -178,12 +182,99 @@ class JobManager:
                       deep_local=deep_local, selected_cities=list(cities),
                       filter_mode=filter_mode, batch=batch, workers=workers, pages=pages,
                       log_file=base/'motore_web.log')
+            if self.archive and not (base / 'progress.sqlite3').exists():
+                # Il nuovo processo riprende da R2, mai da un database vuoto
+                # se per questo piano esiste già un checkpoint remoto.
+                previous = self.archive.get_manifest(user, job.id)
+                if previous:
+                    manifest = self.archive.restore_checkpoint(
+                        user, job.id, base / 'progress.sqlite3')
+                    restore_raw_from_database(base / 'progress.sqlite3',
+                                              base / 'attivita_originali.csv')
+                    job.cloud_saved_at = int(manifest.get('updated_at', 0))
             self.jobs[user] = job
             self.active_id = job.id
             thread = threading.Thread(target=self._run, args=(job,), daemon=True,
                                       name=f"turbo-{user_slug}")
             thread.start()
             return job
+
+    def archived_jobs(self, user: str) -> list[dict]:
+        return self.archive.list_jobs(user) if self.archive else []
+
+    def restore_saved(self, user: str, job_id: str) -> Job:
+        if not self.archive:
+            raise StorageError('Cloudflare R2 non configurato.')
+        with self.lock:
+            if self.active_id:
+                raise RuntimeError('Ferma la ricerca in corso prima di ripristinarne un’altra.')
+            metadata = self.archive.get_manifest(user, job_id)
+            if not metadata:
+                raise StorageError('Ricerca salvata non disponibile.')
+            cities = metadata.get('cities', [])
+            categories = metadata.get('categories', [])
+            depth = metadata.get('depth', 'Approfondita')
+            if not (isinstance(cities, list) and isinstance(categories, list)
+                    and cities and categories):
+                raise StorageError('Il manifesto salvato è incompleto.')
+            search_categories = core.search_variants(categories, depth)
+            user_slug = hashlib.sha256(user.encode()).hexdigest()[:12]
+            pages = int(metadata.get('pages', 10))
+            base, dest = core.make_plan(
+                cities, search_categories, f'web_{user_slug}_{depth.lower()}_p{pages}')
+            if dest.stem != job_id:
+                raise StorageError('Identificativo ricerca e metadati non corrispondono.')
+            info = self.archive.restore_checkpoint(
+                user, job_id, base / 'progress.sqlite3')
+            raw = base / 'attivita_originali.csv'
+            restore_raw_from_database(base / 'progress.sqlite3', raw)
+            job = Job(
+                user=user, id=job_id, name=job_id, base=base, dest=dest,
+                categories=categories, search_categories=search_categories,
+                depth=depth, exclude_chains=bool(metadata.get('exclude_chains', True)),
+                extra_brands=metadata.get('extra_brands', []),
+                search_count=len(cities)*len(search_categories),
+                n_cities=len(cities),
+                deep_local=len(cities) == 1 and len(categories) == 1,
+                selected_cities=cities,
+                filter_mode=metadata.get('filter_mode', 'rigoroso'),
+                workers=int(metadata.get('workers', 2)),
+                pages=pages, batch=int(metadata.get('batch', 100)),
+                log_file=base / 'motore_web.log',
+                cloud_saved_at=int(info.get('updated_at', 0)),
+                status='Archivio R2 ripristinato; pronto a continuare', done=True
+            )
+            self._update(job, raw, rejected=dest.with_name(dest.stem+'_scartati.csv'))
+            self.jobs[user] = job
+            return job
+
+    def _checkpoint(self, job: Job):
+        if not self.archive or not (job.base / 'progress.sqlite3').exists():
+            return
+        metadata = {
+            'cities': job.selected_cities,
+            'categories': job.categories,
+            'depth': job.depth,
+            'exclude_chains': job.exclude_chains,
+            'extra_brands': job.extra_brands,
+            'filter_mode': job.filter_mode,
+            'pages': job.pages,
+            'batch': job.batch,
+            'workers': job.workers,
+            'search_count': job.search_count,
+            'completed': completed_queries(job.base),
+            'found': job.found,
+            'raw_count': job.raw_count,
+        }
+        try:
+            saved = self.archive.save_checkpoint(
+                job.user, job.id, job.base / 'progress.sqlite3', metadata)
+            with job.lock:
+                job.cloud_saved_at = int(saved.get('updated_at', 0))
+                job.cloud_error = ''
+        except (StorageError, ValueError, OSError) as exc:
+            with job.lock:
+                job.cloud_error = str(exc)[:220]
 
     def stop(self, user: str):
         job = self.user_job(user)
@@ -222,6 +313,8 @@ class JobManager:
             job.status = 'Interrotto'
             return
         raw = job.base / 'attivita_originali.csv'
+        if not raw.exists() and (job.base / 'progress.sqlite3').exists():
+            restore_raw_from_database(job.base / 'progress.sqlite3', raw)
         rejected = job.dest.with_name(job.dest.stem + '_scartati.csv')
         launcher = job.base / 'avvio_motore.py'
         launcher.write_text('''import os
@@ -242,6 +335,8 @@ raise SystemExit(engine.run(settings))
         max_groups = 6
         time_budget_seconds = 10 * 60
         previous_done = completed_queries(job.base)
+        last_checkpoint = time.monotonic()
+        last_checkpoint_done = previous_done
         exit_code = 0
         no_progress = False
 
@@ -281,9 +376,17 @@ raise SystemExit(engine.run(settings))
                             job.process.kill()
                         break
                     self._update(job, raw, rejected=None)
+                    if (self.archive and time.monotonic() - last_checkpoint >= 90
+                            and completed_queries(job.base) > last_checkpoint_done):
+                        self._checkpoint(job)
+                        last_checkpoint = time.monotonic()
+                        last_checkpoint_done = completed_queries(job.base)
                 exit_code = job.process.wait()
             self._update(job, raw, rejected=None)
+            self._checkpoint(job)
+            last_checkpoint = time.monotonic()
             current_done = completed_queries(job.base)
+            last_checkpoint_done = current_done
             if exit_code != 0 or job.cancel.is_set():
                 break
             if current_done <= previous_done:
@@ -336,6 +439,7 @@ raise SystemExit(engine.run(settings))
                     job.error = 'Ricerca territoriale non terminata; risultati generali disponibili.'
 
         self._update(job, raw, rejected=rejected)
+        self._checkpoint(job)
         completed = completed_queries(job.base)
         with job.lock:
             if job.cancel.is_set():
@@ -365,6 +469,36 @@ raise SystemExit(engine.run(settings))
                 job.rejected = len(core.split_by_relevance(rows, job.categories, job.filter_mode,
                                                           job.exclude_chains, job.extra_brands)[1])
 
+
+
+
+def restore_raw_from_database(db_path: Path, raw_path: Path) -> int:
+    """Ricrea il CSV grezzo dal database archiviato, senza chiamate web."""
+    if not db_path.exists():
+        return 0
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    temp = raw_path.with_suffix('.recover.tmp')
+    columns = ['name', 'category', 'address', 'phone', 'phone_intl',
+               'website', 'email', 'place_id', 'query']
+    count = 0
+    try:
+        with sqlite3.connect(str(db_path)) as db:
+            with temp.open('w', newline='', encoding='utf-8') as out:
+                writer = csv.DictWriter(out, fieldnames=columns)
+                writer.writeheader()
+                cur = db.execute(
+                    'SELECT name, categories, address, phone, phone_intl, '
+                    'website, email, place_id, query FROM places'
+                )
+                for record in cur:
+                    writer.writerow(dict(zip(columns, record)))
+                    count += 1
+        os.replace(temp, raw_path)
+    except (sqlite3.Error, OSError) as exc:
+        raise StorageError('Impossibile ricostruire il CSV dal backup') from exc
+    finally:
+        temp.unlink(missing_ok=True)
+    return count
 
 
 def completed_queries(base: Path) -> int:
