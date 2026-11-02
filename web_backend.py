@@ -10,7 +10,9 @@ import hashlib
 import io
 import json
 import os
+import re
 import sqlite3
+import zipfile
 from pathlib import Path
 import signal
 import subprocess
@@ -21,7 +23,7 @@ from dataclasses import dataclass, field
 
 import turbo_scraper as core
 from r2_archive import R2Archive, StorageError
-from durable_storage import GitHubStorage, make_checkpoint, restore_checkpoint
+from durable_storage import GitHubStorage, make_checkpoint, restore_checkpoint, user_tag
 
 
 MAX_CATEGORIES = 30
@@ -300,6 +302,119 @@ class JobManager:
         except (StorageError, ValueError, OSError) as exc:
             with job.lock:
                 job.cloud_error = str(exc)[:220]
+
+
+    def create_portable_backup(self, user: str, preferences: dict | None = None) -> bytes:
+        """Backup trasferibile al computer dell'utente senza servizi esterni."""
+        with self.lock:
+            job = self.jobs.get(user)
+            if not job:
+                raise ValueError('Nessuna ricerca da salvare. Avvia prima la raccolta.')
+            if not job.done or self.active_id:
+                raise RuntimeError('Interrompi o termina prima la ricerca per un backup completo.')
+            metadata = {
+                'cities': job.selected_cities, 'categories': job.categories,
+                'depth': job.depth, 'exclude_chains': job.exclude_chains,
+                'extra_brands': job.extra_brands, 'filter_mode': job.filter_mode,
+                'pages': job.pages, 'workers': job.workers, 'batch': job.batch,
+                'completed': completed_queries(job.base),
+            }
+            return make_checkpoint(
+                job.base, job.dest, user, job.id,
+                run_config=metadata, preferences=preferences or {},
+            )
+
+    def restore_portable_backup(self, user: str, payload: bytes) -> tuple[Job, dict]:
+        """Ripristina ricerca e opzioni da ZIP, con controllo utente e piano.
+
+        La precedente ricerca locale viene protetta da backup più vecchi:
+        non si sovrascrivono progressi più avanzati.
+        """
+        with self.lock:
+            if self.active_id:
+                raise RuntimeError('Interrompi prima la ricerca attiva.')
+            if len(payload) > 60 * 1024 * 1024:
+                raise ValueError('Il backup supera la dimensione consentita di 60 MB.')
+            try:
+                with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                    manifest = json.loads(zf.read('manifest.json').decode('utf-8'))
+            except (OSError, ValueError, KeyError, zipfile.BadZipFile) as exc:
+                raise ValueError('Il file non è un backup TURBO valido.') from exc
+            if (not isinstance(manifest, dict) or
+                    manifest.get('user_tag') != user_tag(user)):
+                raise ValueError('Questo backup appartiene a un altro utente.')
+            config = manifest.get('run_config')
+            if not isinstance(config, dict):
+                raise ValueError('Backup precedente senza opzioni di ripresa. Occorre un backup della nuova versione.')
+            cities = config.get('cities', [])
+            categories = config.get('categories', [])
+            if (not isinstance(cities, list) or not 1 <= len(cities) <= 8500
+                    or not isinstance(categories, list)
+                    or not 1 <= len(categories) <= MAX_CATEGORIES):
+                raise ValueError('Territorio o categorie non validi.')
+            if any(not isinstance(c, dict)
+                   or not isinstance(c.get('name'), str)
+                   or not 1 <= len(c['name']) <= 100
+                   or not re.fullmatch('[A-Z]{2}', str(c.get('prov', '')))
+                   for c in cities):
+                raise ValueError('Dati dei comuni non validi.')
+            if any(not isinstance(c, str) or not 1 <= len(c) <= 70 for c in categories):
+                raise ValueError('Categorie non valide.')
+            depth = config.get('depth')
+            if depth not in ('Veloce', 'Equilibrata', 'Approfondita'):
+                raise ValueError('Modalità non valida.')
+            pages = config.get('pages')
+            workers = config.get('workers')
+            batch = config.get('batch')
+            filter_mode = config.get('filter_mode')
+            if (type(pages) is not int or type(workers) is not int
+                    or type(batch) is not int or not 1 <= pages <= MAX_PAGES
+                    or not 1 <= workers <= MAX_WORKERS
+                    or not 1 <= batch <= MAX_SEARCHES
+                    or filter_mode not in ('rigoroso', 'ampio')):
+                raise ValueError('Opzioni del motore non valide.')
+            extra = config.get('extra_brands', [])
+            if (not isinstance(extra, list) or len(extra) > 80
+                    or any(not isinstance(x, str) or len(x) > 70 for x in extra)):
+                raise ValueError('Marchi esclusi non validi.')
+            slug = hashlib.sha256(user.encode()).hexdigest()[:12]
+            variants = core.search_variants(categories, depth)
+            base, dest = core.make_plan(
+                cities, variants, f'web_{slug}_{depth.lower()}_p{pages}'
+            )
+            if dest.stem != manifest.get('plan_id'):
+                raise ValueError('Configurazione e identificativo del backup non coincidono.')
+            already_done = completed_queries(base)
+            backup_done = config.get('completed', 0)
+            if type(backup_done) is not int or backup_done < 0:
+                raise ValueError('Avanzamento del backup non valido.')
+            if already_done > backup_done:
+                raise ValueError(
+                    'Sul server esiste una copia più avanzata. '
+                    'Non sovrascrivo i risultati più recenti.'
+                )
+            restored = restore_checkpoint(payload, user, expected_id=dest.stem)
+            raw = base / 'attivita_originali.csv'
+            if not raw.exists():
+                restore_raw_from_database(base / 'progress.sqlite3', raw)
+            job = Job(
+                user=user, id=dest.stem, name=dest.stem, base=base, dest=dest,
+                categories=categories, search_categories=variants,
+                depth=depth, exclude_chains=bool(config.get('exclude_chains', True)),
+                extra_brands=extra,
+                search_count=len(cities) * len(variants), n_cities=len(cities),
+                deep_local=len(cities) == 1 and len(categories) == 1,
+                selected_cities=cities, filter_mode=filter_mode,
+                workers=workers, pages=pages, batch=batch,
+                status='Backup ripristinato: pronto a continuare',
+                done=True, log_file=base / 'motore_web.log'
+            )
+            self.jobs[user] = job
+            self._update(job, raw, rejected=dest.with_name(dest.stem + '_scartati.csv'))
+            preferences = restored.get('preferences', {})
+            if not isinstance(preferences, dict):
+                preferences = {}
+            return job, preferences
 
     def stop(self, user: str):
         job = self.user_job(user)
