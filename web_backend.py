@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import sqlite3
 from pathlib import Path
 import signal
 import subprocess
@@ -209,16 +210,20 @@ class JobManager:
                     self.active_id = None
 
     def _execute(self, job: Job):
+        """Esegue più gruppi, mantenendo sempre lo stato SQLite esistente.
+
+        Il sito gratuito può sospendersi: questa funzione non promette di
+        completare ricerche nazionali in un'unica sessione.
+        """
         with job.lock:
             job.status = 'Preparo il motore'
-        # Le dipendenze curl_cffi / requests sono installate in fase di deploy da requirements.txt.
-        main = core.ensure_engine()
+        core.ensure_engine()
         if job.cancel.is_set():
             job.status = 'Interrotto'
             return
-        raw = job.base/'attivita_originali.csv'
+        raw = job.base / 'attivita_originali.csv'
         rejected = job.dest.with_name(job.dest.stem + '_scartati.csv')
-        launcher = job.base/'avvio_motore.py'
+        launcher = job.base / 'avvio_motore.py'
         launcher.write_text('''import os
 import sys
 sys.path.insert(0, sys.argv[1])
@@ -231,38 +236,67 @@ settings.collect_emails = False
 settings.collect_details = os.environ.get('TURBO_DETAILS') == '1'
 raise SystemExit(engine.run(settings))
 ''', encoding='utf-8')
-        cmd = [sys.executable, str(launcher), str(core.ENGINE),
-               'run', '--categories', str(job.base/'categories.txt'),
-               '--locations-dir', str(job.base/'locations'),
-               '--db', str(job.base/'progress.sqlite3'),
-               '--out', str(raw), '--reviews-out', str(job.base/'reviews.csv'),
-               '--workers', str(job.workers), '--max-pages', str(job.pages),
-               '--limit-queries', str(job.batch), '--lang', 'it', '--gl', 'it',
-               '--min-interval', '0.8', '--delay-min', '1', '--delay-max', '2.2',
-               '--direct']
-        with job.lock:
-            job.status = 'Ricerca in corso'
         environment = dict(os.environ, TURBO_DETAILS='0' if job.depth == 'Veloce' else '1')
-        # Redirige stdout, evitando output voluminosi nei log del server Streamlit.
-        with job.log_file.open('ab') as logfile:
-            logfile.write(f'\n--- Avvio lotto {time.strftime("%F %T")} ---\n'.encode())
-            logfile.flush()
-            job.process = subprocess.Popen(cmd, cwd=core.ENGINE, stdout=logfile,
-                                           stderr=subprocess.STDOUT, env=environment)
-            while job.process.poll() is None:
-                if job.cancel.wait(4):
-                    job.process.terminate()
-                    try:
-                        job.process.wait(timeout=12)
-                    except subprocess.TimeoutExpired:
-                        job.process.kill()
-                    break
-                self._update(job, raw, rejected=None)
-            exit_code = job.process.wait()
-        # Per una ricerca mirata in una sola città esegue anche celle geografiche.
-        # La scansione per griglia non è adatta a lanciare tutta Italia sul
-        # piano gratuito: richiede molte più richieste e può essere limitata.
-        if job.deep_local and not job.cancel.is_set() and exit_code == 0:
+        start_time = time.monotonic()
+        # Gruppi consecutivi e un limite di durata: lo stato rimane riprendibile.
+        max_groups = 6
+        time_budget_seconds = 10 * 60
+        previous_done = completed_queries(job.base)
+        exit_code = 0
+        no_progress = False
+
+        for round_no in range(max_groups):
+            if job.cancel.is_set() or previous_done >= job.search_count:
+                break
+            with job.lock:
+                job.status = ('Ricerca in corso — '
+                              f'{previous_done:,}/{job.search_count:,} ricerche completate')
+            cmd = [
+                sys.executable, str(launcher), str(core.ENGINE),
+                'run', '--categories', str(job.base / 'categories.txt'),
+                '--locations-dir', str(job.base / 'locations'),
+                '--db', str(job.base / 'progress.sqlite3'),
+                '--out', str(raw), '--reviews-out', str(job.base / 'reviews.csv'),
+                '--workers', str(job.workers), '--max-pages', str(job.pages),
+                '--limit-queries', str(job.batch), '--lang', 'it', '--gl', 'it',
+                '--min-interval', '0.8', '--delay-min', '1', '--delay-max', '2.2',
+                '--direct'
+            ]
+            with job.log_file.open('ab') as logfile:
+                logfile.write(
+                    f'\n--- Gruppo {round_no + 1} | '
+                    f'{time.strftime("%F %T")} | gia concluse {previous_done} ---\n'.encode()
+                )
+                logfile.flush()
+                job.process = subprocess.Popen(
+                    cmd, cwd=core.ENGINE, stdout=logfile,
+                    stderr=subprocess.STDOUT, env=environment
+                )
+                while job.process.poll() is None:
+                    if job.cancel.wait(4):
+                        job.process.terminate()
+                        try:
+                            job.process.wait(timeout=12)
+                        except subprocess.TimeoutExpired:
+                            job.process.kill()
+                        break
+                    self._update(job, raw, rejected=None)
+                exit_code = job.process.wait()
+            self._update(job, raw, rejected=None)
+            current_done = completed_queries(job.base)
+            if exit_code != 0 or job.cancel.is_set():
+                break
+            if current_done <= previous_done:
+                no_progress = True
+                break
+            previous_done = current_done
+            if time.monotonic() - start_time >= time_budget_seconds:
+                break
+
+        # La ricerca a griglia si esegue solo quando è stata completata la
+        # ricerca generale per una singola città e una singola categoria.
+        if (job.deep_local and not job.cancel.is_set() and exit_code == 0
+                and completed_queries(job.base) >= job.search_count):
             city = job.selected_cities[0]
             category = job.categories[0]
             with job.lock:
@@ -273,12 +307,12 @@ raise SystemExit(engine.run(settings))
                 '--location', f'{city["name"]}, {city["prov"]}, Italia',
                 '--all', '--cell-km', '4', '--radius-km', '5',
                 '--no-emails', '--no-details',
-                '--db', str(job.base/'progress.sqlite3'),
-                '--out', str(raw), '--reviews-out', str(job.base/'reviews.csv'),
+                '--db', str(job.base / 'progress.sqlite3'),
+                '--out', str(raw), '--reviews-out', str(job.base / 'reviews.csv'),
                 '--workers', '2', '--max-pages', '6',
                 '--lang', 'it', '--gl', 'it',
                 '--min-interval', '1.0', '--delay-min', '1.2',
-                '--delay-max', '3.0', '--direct',
+                '--delay-max', '3.0', '--direct'
             ]
             with job.log_file.open('ab') as logfile:
                 logfile.write(b'\n--- Ricerca territoriale per zone ---\n')
@@ -286,7 +320,7 @@ raise SystemExit(engine.run(settings))
                 job.process = subprocess.Popen(
                     grid_cmd, cwd=core.ENGINE, stdout=logfile,
                     stderr=subprocess.STDOUT,
-                    env=dict(os.environ, TURBO_DETAILS='0'),
+                    env=dict(os.environ, TURBO_DETAILS='0')
                 )
                 while job.process.poll() is None:
                     if job.cancel.wait(4):
@@ -299,21 +333,25 @@ raise SystemExit(engine.run(settings))
                     self._update(job, raw, rejected=None)
                 grid_exit = job.process.wait()
                 if grid_exit != 0 and not job.cancel.is_set():
-                    with job.lock:
-                        job.error = ('Ricerca a zone non completata: rimangono '
-                                     'disponibili i risultati della ricerca generale. '
-                                     'Verifica il log tecnico.')
-            self._update(job, raw, rejected=None)
+                    job.error = 'Ricerca territoriale non terminata; risultati generali disponibili.'
+
         self._update(job, raw, rejected=rejected)
+        completed = completed_queries(job.base)
         with job.lock:
             if job.cancel.is_set():
-                job.status = 'Interrotto (CSV disponibile)'
-            elif exit_code == 0:
-                job.status = 'Completato (risultati disponibili)'
-            else:
-                job.status = f'Motore terminato con errore ({exit_code})'
+                job.status = 'Interrotto: puoi continuare'
+            elif exit_code != 0:
+                job.status = 'Ricerca interrotta per errore'
                 job.error = (job.log_file.read_text(encoding='utf-8', errors='replace')[-1200:]
-                             if job.log_file.exists() else 'Controlla i log')
+                             if job.log_file.exists() else 'Consulta il log')
+            elif no_progress and completed < job.search_count:
+                job.status = 'Nessun avanzamento: possibile blocco o errore delle richieste'
+                job.error = 'Controlla il log tecnico. Non sono state completate nuove ricerche.'
+            elif completed >= job.search_count:
+                job.status = 'Ricerca generale completata'
+            else:
+                job.status = 'Sessione terminata: ricerca ancora da continuare'
+
 
     def _update(self, job: Job, raw: Path, rejected: Path | None):
         rows = core.read_raw(raw)
@@ -326,6 +364,22 @@ raise SystemExit(engine.run(settings))
             if rejected is not None:
                 job.rejected = len(core.split_by_relevance(rows, job.categories, job.filter_mode,
                                                           job.exclude_chains, job.extra_brands)[1])
+
+
+
+def completed_queries(base: Path) -> int:
+    """Legge quante ricerche il motore ha effettivamente marcato come concluse."""
+    db_path = base / 'progress.sqlite3'
+    if not db_path.exists():
+        return 0
+    try:
+        with sqlite3.connect(str(db_path), timeout=2) as conn:
+            found = conn.execute(
+                "SELECT COUNT(*) FROM searches WHERE status = 'done'"
+            ).fetchone()
+        return int(found[0]) if found else 0
+    except (sqlite3.Error, OSError):
+        return 0
 
 
 def tail_log(path: Path | None, n: int = 14) -> str:

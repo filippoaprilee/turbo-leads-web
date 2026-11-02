@@ -20,6 +20,21 @@ class UpgradeTests(unittest.TestCase):
         accepted, rejected = split_by_relevance(rows, ['palestre'], 'rigoroso', True)
         self.assertEqual([x['name'] for x in accepted], ['Palestra Locale'])
         self.assertEqual(len(rejected), 2)
+    def test_rental_cats(self):
+        from turbo_scraper import category_verdict
+        self.assertTrue(category_verdict(
+            {'name': 'Moto Lecce', 'category': 'Motorcycle rental agency'},
+            ['agenzia di noleggio moto'])[0])
+        self.assertTrue(category_verdict(
+            {'name': 'Scooter Salento', 'category': 'Scooter rental service'},
+            ['agenzia di noleggio scooter'])[0])
+        self.assertTrue(category_verdict(
+            {'name': 'Auto Salento', 'category': 'Car rental agency'},
+            ['agenzia di noleggio auto'])[0])
+        self.assertFalse(category_verdict(
+            {'name': 'Terranova', 'category': 'Clothing store'},
+            ['agenzia di noleggio auto'])[0])
+
     def test_csv(self):
         rows=[{'name':'Palestra Locale','category':'Gym','query':'palestre in Lecce, LE'},
               {'name':'FitActive','category':'Gym','query':'palestre in Lecce, LE'}]

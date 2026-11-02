@@ -5,15 +5,19 @@ Le email non vengono cercate: il CSV conserva la colonna Email vuota.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import hmac
+import json
 import threading
 import time
 
 import streamlit as st
 
+import turbo_scraper as core
 from turbo_scraper import FITNESS, get_dataset, search_variants
 from web_backend import (JobManager, MAX_PAGES, MAX_SEARCHES, MAX_WORKERS,
-                         build_categories, parse_geography, safe_csv_bytes,
+                         build_categories, completed_queries, parse_geography, safe_csv_bytes,
                          select_geography, tail_log)
 
 st.set_page_config(page_title='TURBO Leads | Ricerca attività', page_icon='📍',
@@ -26,7 +30,7 @@ st.markdown('''<style>
 
 
 @st.cache_resource
-def manager(cache_schema_version: int = 6) -> JobManager:
+def manager(cache_schema_version: int = 7) -> JobManager:
     # Nuova istanza del gestore quando cambia l'interfaccia JobManager.
     # Evita istanze incompatibili rimaste in cache dopo un deploy Streamlit.
     return JobManager()
@@ -87,7 +91,44 @@ def login():
     st.stop()
 
 
+
+# Profili senza password o token: possono essere salvati nell'URL e in JSON.
+PREF_DEFAULTS = {
+    'p_geo': 'Comuni', 'p_zones': [], 'p_regions': [],
+    'p_provs': [], 'p_cities': [], 'p_limit': 0,
+    'p_allfit': False, 'p_presets': ['palestra'], 'p_manual': '',
+    'p_depth': 'Approfondita', 'p_exclude': True,
+    'p_custom': '', 'p_uncertain': False,
+}
+
+
+def read_pref_token(raw: str) -> dict:
+    if not raw or len(raw) > 12000:
+        return {}
+    try:
+        decoded = base64.urlsafe_b64decode(raw + '=' * (-len(raw) % 4))
+        obj = json.loads(decoded.decode('utf-8'))
+        if not isinstance(obj, dict):
+            return {}
+        return {k: v for k, v in obj.items()
+                if k in PREF_DEFAULTS and isinstance(v, type(PREF_DEFAULTS[k]))}
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return {}
+
+
+def pref_token(profile: dict) -> str:
+    data = json.dumps(profile, ensure_ascii=False, separators=(',', ':'))
+    return base64.urlsafe_b64encode(data.encode('utf-8')).decode('ascii').rstrip('=')
+
+
+def apply_pref(profile: dict):
+    for k, default in PREF_DEFAULTS.items():
+        if k in profile and isinstance(profile[k], type(default)):
+            st.session_state[k] = profile[k]
+
+
 user = login()
+
 
 with st.sidebar:
     st.title('TURBO LEADS')
@@ -99,6 +140,37 @@ with st.sidebar:
         st.rerun()
     st.divider()
     st.caption('Il servizio gratuito può interrompere ricerche lunghe. Scarica il CSV appena disponibile.')
+
+# Prima dei widget: carica preferenze salvate (URL persistente, file locale best effort).
+profile_path = core.STATE / 'profili' / (hashlib.sha256(user.encode()).hexdigest()[:16] + '.json')
+url_token = st.query_params.get('preset', '')
+source_id = str(url_token)
+if st.session_state.get('_prefs_source') != source_id:
+    stored = {}
+    if profile_path.exists():
+        try:
+            stored = json.loads(profile_path.read_text(encoding='utf-8'))
+        except (ValueError, OSError):
+            pass
+    for k, v in PREF_DEFAULTS.items():
+        st.session_state.setdefault(k, v)
+    apply_pref(stored)
+    apply_pref(read_pref_token(url_token))
+    st.session_state['_prefs_source'] = source_id
+
+with st.expander('Preferenze salvate: importa o ripristina'):
+    uploaded_profile = st.file_uploader('Carica un profilo JSON salvato', type=['json'], key='profile_upload')
+    if uploaded_profile is not None and st.button('Ripristina queste preferenze'):
+        try:
+            payload = json.loads(uploaded_profile.getvalue().decode('utf-8'))
+            if not isinstance(payload, dict):
+                raise ValueError('Formato JSON non valido')
+            apply_pref(payload)
+            st.query_params.clear()
+            st.session_state['_prefs_source'] = ''
+            st.rerun()
+        except (ValueError, UnicodeDecodeError) as err:
+            st.error(f'File non valido: {err}')
 
 st.title('Trova attività locali')
 st.write('Seleziona categorie e aree geografiche. Il programma esclude per impostazione predefinita le categorie non pertinenti e crea un CSV scaricabile.')
@@ -119,25 +191,25 @@ city_options = sorted({f"{x['name']} ({x['prov']})" for x in rows})
 st.subheader('1. Area geografica')
 geo = st.selectbox('Che cosa vuoi cercare?',
                    ['Comuni', 'Province', 'Regioni', 'Zone', 'Selezione mista', 'Tutta Italia'],
-                   help='La selezione mista unisce comuni, province, regioni e zone. Non si sovrappongono e non genera duplicati.')
+                   key='p_geo', help='La selezione mista unisce comuni, province, regioni e zone. Non si sovrappongono e non genera duplicati.')
 
 chosen_zones = []
 chosen_regions = []
 chosen_provs_ui = []
 chosen_cities = []
 if geo in ('Zone', 'Selezione mista'):
-    chosen_zones = st.multiselect('Una o più zone geografiche', zones_list,
+    chosen_zones = st.multiselect('Una o più zone geografiche', zones_list, key='p_zones',
                                   placeholder='Nord-ovest, Nord-est, Centro…')
 if geo in ('Regioni', 'Selezione mista'):
-    chosen_regions = st.multiselect('Una o più regioni', region_list,
+    chosen_regions = st.multiselect('Una o più regioni', region_list, key='p_regions',
                                    placeholder='Lombardia, Veneto, Puglia…')
 if geo in ('Province', 'Selezione mista'):
-    chosen_provs_ui = st.multiselect('Una o più province', province_options,
+    chosen_provs_ui = st.multiselect('Una o più province', province_options, key='p_provs',
                                     placeholder='MI — Milano, LE — Lecce…')
 if geo in ('Comuni', 'Selezione mista'):
     if geo == 'Comuni':
         st.caption('Puoi selezionare più comuni anche di province diverse. Le sigle evitano ambiguità fra comuni con lo stesso nome.')
-    chosen_cities = st.multiselect('Uno o più comuni', city_options,
+    chosen_cities = st.multiselect('Uno o più comuni', city_options, key='p_cities',
                                    placeholder='Lecce (LE), Milano (MI), Torino (TO)…')
 
 chosen_provs = [s.split(' — ', 1)[0] for s in chosen_provs_ui]
@@ -146,8 +218,8 @@ selected = select_geography(rows, mode=geo, zones=chosen_zones,
                             cities=chosen_cities)
 if len(selected) > 500:
     st.caption('I comuni sono ordinati per popolazione per privilegiare inizialmente le città più grandi.')
-limit = st.number_input('Limita il piano ai primi N comuni (0 = tutti i selezionati)',
-                        min_value=0, max_value=8500, value=0, step=25)
+limit = st.number_input('Analizza prima i comuni più popolosi (0 = tutti)',
+                        min_value=0, max_value=8500, step=25, key='p_limit')
 if limit:
     selected = selected[:int(limit)]
 
@@ -157,12 +229,11 @@ category_presets = sorted(set(FITNESS + [
     'bar', 'farmacia', 'hotel', 'meccanico', 'carrozzeria', 'idraulico',
     'elettricista', 'agenzia immobiliare', 'lavanderia', 'studio medico',
 ]))
-all_fitness = st.checkbox('Tutte le 24 categorie fitness e benessere', value=False)
+all_fitness = st.checkbox('Tutte le 24 categorie fitness e benessere', key='p_allfit')
 presets = st.multiselect('Categorie predefinite', category_presets,
-                         default=['palestra'] if not all_fitness else FITNESS,
-                         disabled=all_fitness)
+                         key='p_presets', disabled=all_fitness)
 manual = st.text_input('Altre categorie personalizzate (separate da virgola)',
-                       placeholder='es. ferramenta, negozio animali, veterinario')
+                       key='p_manual', placeholder='es. ferramenta, negozio animali, veterinario')
 try:
     categories = build_categories(FITNESS if all_fitness else presets, manual)
     category_error = ''
@@ -172,20 +243,20 @@ except ValueError as ex:
 st.subheader('3. Come vuoi cercare?')
 st.caption('La modalità approfondita è già selezionata. Non devi impostare parametri tecnici.')
 depth = st.radio('Tipo di ricerca',
-    ['Approfondita', 'Equilibrata', 'Veloce'], index=0,
+    ['Approfondita', 'Equilibrata', 'Veloce'], key='p_depth',
     help='Approfondita cerca con sinonimi e più pagine. Su un solo comune e una sola categoria esamina anche zone diverse della città.')
 st.caption({
     'Approfondita': 'Consigliata: più ricerche alternative, fino a 10 pagine per ricerca. Con un comune e una categoria controlla anche diverse zone della città.',
     'Equilibrata': 'Un compromesso: due modi di cercare la stessa categoria e cinque pagine.',
     'Veloce': 'Meno ricerche e meno pagine. Adatta per un primo controllo.',
 }[depth])
-exclude_chains = st.checkbox('Escludi grandi catene e franchising conosciuti', value=True)
+exclude_chains = st.checkbox('Escludi grandi catene e franchising conosciuti', key='p_exclude')
 with st.expander('Preferenze facoltative'):
     st.caption('Il riconoscimento delle catene è basato su nomi conosciuti, non su verifiche societarie. Alcune possono sfuggire.')
     custom_brands = st.text_area('Altri marchi da escludere (facoltativo)',
-        placeholder='Un marchio per riga, per esempio: Nome Catena')
+        key='p_custom', placeholder='Un marchio per riga, per esempio: Nome Catena')
     extra_brands = [x.strip() for x in custom_brands.replace('\n', ',').split(',') if x.strip()]
-    include_uncertain = st.checkbox('Includi anche attività dalla categoria incerta', value=False)
+    include_uncertain = st.checkbox('Includi anche attività dalla categoria incerta', key='p_uncertain')
 mode = 'ampio' if include_uncertain else 'rigoroso'
 batch = {'Veloce': 80, 'Equilibrata': 60, 'Approfondita': 100}[depth]
 workers = 2
@@ -203,9 +274,28 @@ if category_error:
 if len(selected)*len(variants) > 2000:
     st.info('Piano ampio: esegui più lotti piccoli. La modalità gratuita non garantisce che l’app continui a elaborare se il server viene sospeso.')
 
+
+st.subheader('Salva le tue preferenze')
+profile = {k: st.session_state.get(k, v) for k, v in PREF_DEFAULTS.items()}
+pref_cols = st.columns([1, 1])
+with pref_cols[0]:
+    if st.button('Salva preferenze e categorie', use_container_width=True):
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        profile_path.write_text(json.dumps(profile, ensure_ascii=False, indent=2),
+                                encoding='utf-8')
+        st.query_params['preset'] = pref_token(profile)
+        st.session_state['_prefs_source'] = st.query_params['preset']
+        st.success('Preferenze salvate. Aggiungi questa pagina ai preferiti del browser per riaprirle anche dopo il riavvio del server.')
+with pref_cols[1]:
+    st.download_button('Scarica profilo JSON', data=json.dumps(
+        profile, ensure_ascii=False, indent=2).encode('utf-8'),
+        file_name='turbo_leads_preferenze.json', mime='application/json',
+        use_container_width=True)
+st.caption('Il segnalibro e il file JSON conservano categorie, territori e marchi esclusi. Le password non vengono salvate.')
+
 job = manager().user_job(user)
 run_disabled = bool(category_error or not selected or not categories or (job and not job.done))
-if st.button('Cerca attività', type='primary', use_container_width=True, disabled=run_disabled):
+if st.button('Avvia / continua ricerca', type='primary', use_container_width=True, disabled=run_disabled):
     try:
         manager().submit(user=user, cities=selected, categories=categories,
                          batch=int(batch), workers=int(workers), pages=int(pages),
@@ -235,15 +325,22 @@ def live_job():
         done = current.done
         err = current.error
     st.write('**Stato:**', status)
+    finished_queries = completed_queries(current.base)
+    planned_queries = max(1, current.search_count)
+    st.progress(min(1.0, finished_queries / planned_queries),
+                text=f'Ricerche completate: {finished_queries:,} su {planned_queries:,} — '
+                     f'ne mancano {max(0, planned_queries - finished_queries):,}')
     a, b, c = st.columns(3)
     a.metric('Attività pertinenti', found)
     b.metric('Risultati grezzi', raw_count)
     c.metric('Esclusi a fine lotto', rejected)
     if not done:
-        st.progress(0, text='Ricerca sul server in corso…')
+        st.caption('La raccolta prosegue sul server. Puoi scaricare il CSV parziale.')
         if st.button('Interrompi ricerca', key='stop_running'):
             manager().stop(user)
             st.rerun(scope='fragment')
+    if done and finished_queries < planned_queries:
+        st.info('Questa sessione non ha completato l’intero territorio. Premi “Avvia / continua ricerca” sopra per ripartire dalle ricerche ancora mancanti, conservando i contatti già trovati.')
     if current.dest.exists():
         payload = safe_csv_bytes(current.dest)
         if payload:
