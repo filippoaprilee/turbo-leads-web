@@ -16,6 +16,7 @@ import streamlit as st
 
 import turbo_scraper as core
 from turbo_scraper import FITNESS, get_dataset, search_variants
+from r2_archive import R2Archive, StorageError
 from web_backend import (JobManager, MAX_PAGES, MAX_SEARCHES, MAX_WORKERS,
                          build_categories, completed_queries, parse_geography, safe_csv_bytes,
                          select_geography, tail_log)
@@ -30,10 +31,11 @@ st.markdown('''<style>
 
 
 @st.cache_resource
-def manager(cache_schema_version: int = 7) -> JobManager:
-    # Nuova istanza del gestore quando cambia l'interfaccia JobManager.
-    # Evita istanze incompatibili rimaste in cache dopo un deploy Streamlit.
-    return JobManager()
+def manager(cache_schema_version: int = 8) -> JobManager:
+    # Cambio schema: non riutilizzare oggetti JobManager di versioni precedenti.
+    config = dict(st.secrets.get('r2', {}))
+    archive = R2Archive(config) if config else None
+    return JobManager(archive=archive)
 
 
 @st.cache_resource
@@ -155,6 +157,11 @@ if st.session_state.get('_prefs_source') != source_id:
     for k, v in PREF_DEFAULTS.items():
         st.session_state.setdefault(k, v)
     apply_pref(stored)
+    if manager().archive:
+        try:
+            apply_pref(manager().archive.load_profile(user))
+        except StorageError as exc:
+            st.warning(f'Preferenze cloud non recuperate: {exc}')
     apply_pref(read_pref_token(url_token))
     st.session_state['_prefs_source'] = source_id
 
@@ -285,7 +292,15 @@ with pref_cols[0]:
                                 encoding='utf-8')
         st.query_params['preset'] = pref_token(profile)
         st.session_state['_prefs_source'] = st.query_params['preset']
-        st.success('Preferenze salvate. Aggiungi questa pagina ai preferiti del browser per riaprirle anche dopo il riavvio del server.')
+        if manager().archive:
+            try:
+                manager().archive.save_profile(user, profile)
+                st.success('Preferenze salvate in Cloudflare R2. Disponibili anche dopo un riavvio.')
+            except StorageError as exc:
+                st.error(f'Cloud R2 non aggiornato: {exc}')
+                st.info('Puoi utilizzare comunque il segnalibro o scaricare il profilo JSON.')
+        else:
+            st.warning('Profilo salvato soltanto in locale/URL: collega R2 per un salvataggio permanente nel cloud.')
 with pref_cols[1]:
     st.download_button('Scarica profilo JSON', data=json.dumps(
         profile, ensure_ascii=False, indent=2).encode('utf-8'),
@@ -306,6 +321,54 @@ if st.button('Avvia / continua ricerca', type='primary', use_container_width=Tru
         st.error('Non è stato possibile avviare la ricerca.')
         st.caption(f'Dettaglio tecnico: {type(err).__name__}: {str(err)[:300]}')
         st.caption('Se hai appena aggiornato il sito, riavvia l’app da Streamlit Cloud.')
+
+
+st.subheader('Archivio permanente delle ricerche')
+if manager().archive:
+    st.success('Cloudflare R2 configurato. Le copie del database vengono archiviate durante la ricerca e a fine gruppo.')
+    col_test, col_reload = st.columns(2)
+    with col_test:
+        if st.button('Verifica collegamento R2', use_container_width=True):
+            try:
+                manager().archive.probe()
+                st.success('Collegamento riuscito: bucket raggiungibile.')
+            except StorageError as err:
+                st.error(str(err))
+    with col_reload:
+        if st.button('Aggiorna elenco ricerche salvate', use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+    @st.cache_data(ttl=90, show_spinner=False)
+    def archived_searches(username: str, cache_version: int = 1):
+        return manager().archived_jobs(username)
+
+    try:
+        saved_jobs = archived_searches(user)
+        if saved_jobs:
+            options = {
+                j['id']: (f"{', '.join(j.get('categories', []))[:70]} — "
+                          f"{j.get('n_cities', len(j.get('cities', [])))} comuni — "
+                          f"{j.get('completed', 0)}/{j.get('search_count', '?')} ricerche")
+                for j in saved_jobs
+            }
+            selected_job = st.selectbox(
+                'Ricerche già archiviate', options=list(options),
+                format_func=lambda x: options[x])
+            if st.button('Ripristina questa ricerca e il suo CSV',
+                         use_container_width=True):
+                try:
+                    manager().restore_saved(user, selected_job)
+                    st.rerun()
+                except (StorageError, RuntimeError, ValueError) as ex:
+                    st.error(str(ex))
+        else:
+            st.caption('Nessuna ricerca archiviata: i nuovi checkpoint compariranno qui.')
+    except StorageError as ex:
+        st.error(f'Impossibile consultare l’archivio R2: {ex}')
+else:
+    st.warning('Archivio permanente non collegato: il server può perdere risultati e avanzamento quando viene riavviato.')
+    st.caption('Crea un bucket R2 privato dedicato e configura la sezione [r2] nei Secrets di Streamlit. Le credenziali non vanno su GitHub.')
 
 st.divider()
 st.subheader('4. Stato e risultati')
@@ -340,7 +403,31 @@ def live_job():
             manager().stop(user)
             st.rerun(scope='fragment')
     if done and finished_queries < planned_queries:
-        st.info('Questa sessione non ha completato l’intero territorio. Premi “Avvia / continua ricerca” sopra per ripartire dalle ricerche ancora mancanti, conservando i contatti già trovati.')
+        st.info('La ricerca non ha ancora coperto tutto il territorio.')
+        if st.button('Continua questa ricerca dalle attività già salvate',
+                     key='resume_same_plan', use_container_width=True):
+            try:
+                manager().submit(
+                    user=user, cities=current.selected_cities,
+                    categories=current.categories, batch=current.batch,
+                    workers=current.workers, pages=current.pages,
+                    filter_mode=current.filter_mode, depth=current.depth,
+                    exclude_chains=current.exclude_chains,
+                    extra_brands=current.extra_brands)
+                st.rerun()
+            except (StorageError, RuntimeError, ValueError) as ex:
+                st.error(str(ex))
+    if manager().archive:
+        if current.cloud_saved_at:
+            st.caption(f'Ultimo backup permanente R2: {time.strftime("%d/%m/%Y %H:%M", time.localtime(current.cloud_saved_at))}')
+        elif not done:
+            st.caption('Backup R2 non ancora effettuato: attendo il primo checkpoint.')
+        else:
+            st.warning('Nessun checkpoint R2 confermato per questa ricerca.')
+        if current.cloud_error:
+            st.error('Errore nel backup cloud: ' + current.cloud_error)
+    else:
+        st.warning('I risultati di questa sessione non sono salvati nel cloud R2.')
     if current.dest.exists():
         payload = safe_csv_bytes(current.dest)
         if payload:
