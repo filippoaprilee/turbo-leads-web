@@ -17,6 +17,7 @@ import streamlit as st
 import turbo_scraper as core
 from turbo_scraper import FITNESS, get_dataset, search_variants
 from r2_archive import R2Archive, StorageError
+from durable_storage import GitHubStorage, make_checkpoint, restore_checkpoint
 from web_backend import (JobManager, MAX_PAGES, MAX_SEARCHES, MAX_WORKERS,
                          build_categories, completed_queries, parse_geography, safe_csv_bytes,
                          select_geography, tail_log)
@@ -31,16 +32,30 @@ st.markdown('''<style>
 
 
 @st.cache_resource
-def manager(cache_schema_version: int = 8) -> JobManager:
-    # Cambio schema: non riutilizzare oggetti JobManager di versioni precedenti.
-    config = dict(st.secrets.get('r2', {}))
-    try:
-        archive = R2Archive(config) if config else None
-        return JobManager(archive=archive)
-    except StorageError as err:
-        fallback = JobManager(archive=None)
-        fallback.archive_error = str(err)
-        return fallback
+def manager(cache_schema_version: int = 9) -> JobManager:
+    r2_config = dict(st.secrets.get('r2', {}))
+    github_config = dict(st.secrets.get('github_storage', {}))
+    archive, storage = None, None
+    r2_error, storage_error = '', ''
+    if r2_config:
+        try:
+            archive = R2Archive(r2_config)
+        except StorageError as exc:
+            r2_error = str(exc)
+    if github_config:
+        try:
+            storage = GitHubStorage(
+                repo=str(github_config.get('repo', '')),
+                token=str(github_config.get('token', '')),
+                branch=str(github_config.get('branch', 'main'))
+            )
+            storage.verify_private()
+        except (RuntimeError, ValueError, OSError) as exc:
+            storage, storage_error = None, str(exc)
+    obj = JobManager(archive=archive, storage=storage)
+    obj.archive_error = r2_error
+    obj.storage_error = storage_error
+    return obj
 
 
 @st.cache_resource
@@ -328,6 +343,59 @@ if st.button('Avvia / continua ricerca', type='primary', use_container_width=Tru
         st.caption('Se hai appena aggiornato il sito, riavvia l’app da Streamlit Cloud.')
 
 
+
+st.subheader('Backup delle ricerche — senza costi aggiuntivi')
+if manager().storage:
+    st.success('Backup automatico GitHub PRIVATO attivo. I checkpoint vengono salvati dopo ogni gruppo e recuperati automaticamente per lo stesso piano.')
+    if st.button('Mostra le ricerche salvate su GitHub'):
+        try:
+            st.session_state['_github_plans'] = manager().storage.list_plans(user)
+        except (RuntimeError, ValueError, OSError) as ex:
+            st.error(str(ex))
+    saved_options = st.session_state.get('_github_plans', [])
+    if saved_options:
+        saved_id = st.selectbox('Scegli una ricerca già archiviata', saved_options, key='github_plan')
+        if st.button('Recupera ricerca e CSV da GitHub'):
+            if manager().active_id:
+                st.error('Interrompi prima la ricerca attiva.')
+            else:
+                try:
+                    remote_data = manager().storage.load(user, saved_id)
+                    if remote_data is None:
+                        raise ValueError('Backup non trovato')
+                    recovered = restore_checkpoint(remote_data, user, expected_id=saved_id)
+                    st.session_state['_restored_backup_id'] = recovered['plan_id']
+                    st.success('Checkpoint ripristinato: puoi avviare la stessa ricerca per continuarla.')
+                except (RuntimeError, ValueError, OSError) as ex:
+                    st.error(str(ex))
+elif getattr(manager(), 'storage_error', ''):
+    st.error('Archivio GitHub non operativo: ' + manager().storage_error)
+else:
+    st.info('Backup automatico non ancora configurato. Per ora usa lo ZIP scaricabile qui sotto; dopo il riavvio del server dovrai ricaricarlo.')
+
+with st.expander('Ripristina un backup ZIP scaricato in precedenza'):
+    uploaded_checkpoint = st.file_uploader('Seleziona il backup della ricerca', type=['zip'], key='checkpoint_upload')
+    if st.button('Ripristina questo ZIP'):
+        if manager().active_id:
+            st.error('Interrompi prima la ricerca in corso.')
+        elif not uploaded_checkpoint:
+            st.warning('Seleziona prima il file ZIP.')
+        else:
+            try:
+                restored = restore_checkpoint(uploaded_checkpoint.getvalue(), user)
+                st.session_state['_restored_backup_id'] = restored['plan_id']
+                st.success('Stato e CSV ripristinati. Seleziona le stesse categorie e il territorio per continuare.')
+            except (ValueError, OSError, KeyError, Exception) as exc:
+                st.error(f'Backup non valido: {str(exc)[:220]}')
+restored_id = st.session_state.get('_restored_backup_id', '')
+if restored_id:
+    restored_csv = core.RESULTS / (restored_id + '.csv')
+    if restored_csv.exists():
+        st.download_button('Scarica CSV recuperato dal backup',
+            data=safe_csv_bytes(restored_csv), file_name=restored_id + '.csv',
+            mime='text/csv', use_container_width=True)
+st.caption('Solo GitHub privato è adatto al salvataggio automatico. Non usare il repository pubblico del codice per archiviare contatti.')
+
 st.subheader('Archivio permanente delle ricerche')
 if manager().archive:
     st.success('Cloudflare R2 configurato. Le copie del database vengono archiviate durante la ricerca e a fine gruppo.')
@@ -374,8 +442,8 @@ if manager().archive:
 else:
     if getattr(manager(), 'archive_error', ''):
         st.error('Configurazione R2 incompleta: ' + manager().archive_error)
-    st.warning('Archivio permanente non collegato: il server può perdere risultati e avanzamento quando viene riavviato.')
-    st.caption('Crea un bucket R2 privato dedicato e configura la sezione [r2] nei Secrets di Streamlit. Le credenziali non vanno su GitHub.')
+    if not manager().storage:
+        st.caption('Nessun archivio automatico configurato: per ora utilizza il backup ZIP. Non serve configurare R2.')
 
 st.divider()
 st.subheader('4. Stato e risultati')
@@ -424,6 +492,14 @@ def live_job():
                 st.rerun()
             except (StorageError, RuntimeError, ValueError) as ex:
                 st.error(str(ex))
+    if manager().storage:
+        if current.github_saved_at:
+            st.success('Ultimo backup GitHub privato: ' + time.strftime(
+                '%d/%m/%Y %H:%M', time.localtime(current.github_saved_at)))
+        elif not done:
+            st.caption('Backup automatico in preparazione: attendo i risultati del primo gruppo.')
+        if current.github_error:
+            st.error('Backup GitHub non riuscito: ' + current.github_error)
     if manager().archive:
         if current.cloud_saved_at:
             st.caption(f'Ultimo backup permanente R2: {time.strftime("%d/%m/%Y %H:%M", time.localtime(current.cloud_saved_at))}')
@@ -433,8 +509,22 @@ def live_job():
             st.warning('Nessun checkpoint R2 confermato per questa ricerca.')
         if current.cloud_error:
             st.error('Errore nel backup cloud: ' + current.cloud_error)
-    else:
-        st.warning('I risultati di questa sessione non sono salvati nel cloud R2.')
+    elif not manager().storage:
+        st.warning('I risultati restano temporanei finché non scarichi il backup ZIP.')
+    if (current.base / 'progress.sqlite3').exists():
+        if st.button('Prepara backup ZIP completo della ricerca', key='prepare_backup'):
+            try:
+                st.session_state['_ready_zip'] = make_checkpoint(
+                    current.base, current.dest, user, current.id)
+                st.session_state['_ready_zip_id'] = current.id
+            except (RuntimeError, ValueError, OSError) as exc:
+                st.error('Backup ZIP non disponibile: ' + str(exc)[:240])
+        if (st.session_state.get('_ready_zip_id') == current.id
+                and st.session_state.get('_ready_zip')):
+            st.download_button('Scarica backup ZIP per riprendere dopo il riavvio',
+                data=st.session_state['_ready_zip'],
+                file_name=current.id + '_backup.zip', mime='application/zip',
+                use_container_width=True)
     if current.dest.exists():
         payload = safe_csv_bytes(current.dest)
         if payload:

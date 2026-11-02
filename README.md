@@ -85,3 +85,55 @@ streamlit run app.py
 ```
 
 Il collaudo in rete contro Google Maps va eseguito **dopo il deploy**: qui sono state verificate soltanto la logica, la correttezza locale e l'esportazione dei file.
+
+
+## V8 - Conservare le ricerche gratuitamente
+
+Il disco di Streamlit Community Cloud non e' permanente. Per proseguire
+dopo un riavvio serve un backup precedente: scaricato come file, oppure
+salvato automaticamente su un archivio esterno. Nessun metodo puo'
+garantire un recupero senza almeno una delle due cose.
+
+### Opzione 1: Backup ZIP manuale, senza configurazione
+
+- Durante una ricerca seleziona Prepara backup ZIP completo e scaricalo.
+- Dopo un riavvio vai su Backup delle ricerche, carica lo ZIP e premi Ripristina.
+- Seleziona le stesse categorie, territorio e modalita' e premi Continua.
+- Scarica nuovamente backup e CSV dopo ciascuna sessione.
+
+La copia ZIP deve essere stata scaricata prima che il server perda i dati.
+
+### Opzione 2: Backup automatico sul GitHub gia' collegato
+
+Non richiede Cloudflare R2, Docker, un database o un servizio a pagamento.
+GitHub e' comunque un servizio esterno a Streamlit, gia' in uso.
+
+1. Crea su github.com/new un repository PRIVATO denominato turbo-leads-data
+   e inizializzalo con README (branch main).
+2. GitHub Settings > Developer settings > Personal access tokens >
+   Fine-grained tokens: crea un token limitato a quel repository
+   con permesso Contents: Read and write.
+3. Streamlit Community Cloud > pipps-maben > Settings > Secrets:
+   mantieni la sezione users esistente e aggiungi:
+
+   [github_storage]
+   repo = "filippoaprilee/turbo-leads-data"
+   branch = "main"
+   token = "IL_TUO_TOKEN_FINE_GRAINED"
+
+4. Salva i Secrets e riavvia l'app.
+5. Lo stato SQLite e i CSV vengono salvati automaticamente dopo ogni
+   gruppo di ricerche. Alla ripresa basta reimpostare la stessa ricerca:
+   il checkpoint privato viene caricato prima del lavoro.
+6. Dalla sezione Backup puoi inoltre elencare e ripristinare le ricerche
+   archiviate e scaricarne il CSV.
+
+IMPORTANTE: il repository del codice turbo-leads-web e' PUBBLICO:
+NON inserirvi token, numeri di telefono o backup. Il programma
+rifiuta di caricare dati in un repository GitHub pubblico.
+I backup sono separati per username e piano.
+
+Limite operativo: max 15 MB di backup compresso per piano. Il servizio
+gratuito puo' interrompere l'operazione prima del checkpoint seguente.
+GitHub conserva la cronologia dei commit e applica limiti di spazio/API.
+Non e' garantita la copertura completa delle schede Google Maps.

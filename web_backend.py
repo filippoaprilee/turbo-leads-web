@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 import turbo_scraper as core
 from r2_archive import R2Archive, StorageError
+from durable_storage import GitHubStorage, make_checkpoint, restore_checkpoint
 
 
 MAX_CATEGORIES = 30
@@ -134,6 +135,8 @@ class Job:
     started: float = field(default_factory=time.time)
     cloud_saved_at: int = 0
     cloud_error: str = ''
+    github_saved_at: int = 0
+    github_error: str = ''
     ended: float = 0
     process: subprocess.Popen | None = field(default=None, repr=False)
     cancel: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -142,8 +145,10 @@ class Job:
 
 
 class JobManager:
-    def __init__(self, archive: R2Archive | None = None):
+    def __init__(self, archive: R2Archive | None = None,
+                 storage: GitHubStorage | None = None):
         self.archive = archive
+        self.storage = storage
         self.lock = threading.RLock()
         self.jobs: dict[str, Job] = {}
         self.active_id: str | None = None  # Un job alla volta: hosting gratuito e file condivisi
@@ -192,6 +197,14 @@ class JobManager:
                     restore_raw_from_database(base / 'progress.sqlite3',
                                               base / 'attivita_originali.csv')
                     job.cloud_saved_at = int(manifest.get('updated_at', 0))
+            if self.storage is not None and not (base / 'progress.sqlite3').exists():
+                # Ripristina un checkpoint già presente sul repository privato.
+                # Se GitHub non risponde, interrompe l'avvio senza ricominciare
+                # per errore da zero.
+                saved_blob = self.storage.load(user, job.id)
+                if saved_blob is not None:
+                    restore_checkpoint(saved_blob, user, expected_id=job.id)
+                    job.github_saved_at = int(time.time())
             self.jobs[user] = job
             self.active_id = job.id
             thread = threading.Thread(target=self._run, args=(job,), daemon=True,
@@ -249,7 +262,19 @@ class JobManager:
             return job
 
     def _checkpoint(self, job: Job):
-        if not self.archive or not (job.base / 'progress.sqlite3').exists():
+        if not (job.base / 'progress.sqlite3').exists():
+            return
+        if self.storage:
+            try:
+                payload = make_checkpoint(job.base, job.dest, job.user, job.id)
+                self.storage.save(job.user, job.id, payload)
+                with job.lock:
+                    job.github_saved_at = int(time.time())
+                    job.github_error = ''
+            except (ValueError, OSError, sqlite3.Error, RuntimeError) as exc:
+                with job.lock:
+                    job.github_error = str(exc)[:220]
+        if not self.archive:
             return
         metadata = {
             'cities': job.selected_cities,
@@ -376,7 +401,7 @@ raise SystemExit(engine.run(settings))
                             job.process.kill()
                         break
                     self._update(job, raw, rejected=None)
-                    if (self.archive and time.monotonic() - last_checkpoint >= 90
+                    if ((self.archive or self.storage) and time.monotonic() - last_checkpoint >= 90
                             and completed_queries(job.base) > last_checkpoint_done):
                         self._checkpoint(job)
                         last_checkpoint = time.monotonic()

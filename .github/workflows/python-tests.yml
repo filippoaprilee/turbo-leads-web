@@ -1,7 +1,7 @@
 name: Python regression tests
 on:
   push:
-    branches: [main, v7-progress-resume-preferences]
+    branches: [main, v7-progress-resume-preferences, v8-durable-checkpoints]
   pull_request:
     branches: [main]
 jobs:
@@ -16,6 +16,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Compile modules
-        run: python -m compileall -q app.py web_backend.py turbo_scraper.py tests
+        run: python -m compileall -q app.py web_backend.py turbo_scraper.py durable_storage.py tests
       - name: Run tests
         run: python -m unittest discover -s tests -v
